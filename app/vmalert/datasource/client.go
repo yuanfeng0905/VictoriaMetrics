@@ -102,6 +102,9 @@ func (c *Client) Clone() *Client {
 func (c *Client) ApplyParams(params QuerierParams) *Client {
 	if params.DataSourceType != "" {
 		c.dataSourceType = toDatasourceType(params.DataSourceType)
+		if c.dataSourceType == datasourceVLogs {
+			c.datasourceURL = strings.TrimSuffix(*vlogsAddr, "/")
+		}
 	}
 	c.evaluationInterval = params.EvaluationInterval
 	c.applyIntervalAsTimeFilter = params.ApplyIntervalAsTimeFilter
