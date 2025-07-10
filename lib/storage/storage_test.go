@@ -41,33 +41,6 @@ func TestReplaceAlternateRegexpsWithGraphiteWildcards(t *testing.T) {
 	f("foo(.*)", "foo*")
 }
 
-func TestGetRegexpForGraphiteNodeQuery(t *testing.T) {
-	f := func(q, expectedRegexp string) {
-		t.Helper()
-		re, err := getRegexpForGraphiteQuery(q)
-		if err != nil {
-			t.Fatalf("unexpected error for query=%q: %s", q, err)
-		}
-		reStr := re.String()
-		if reStr != expectedRegexp {
-			t.Fatalf("unexpected regexp for query %q; got %q want %q", q, reStr, expectedRegexp)
-		}
-	}
-	f(``, `^$`)
-	f(`*`, `^[^.]*$`)
-	f(`foo.`, `^foo\.$`)
-	f(`foo.bar`, `^foo\.bar$`)
-	f(`{foo,b*ar,b[a-z]}`, `^(?:foo|b[^.]*ar|b[a-z])$`)
-	f(`[-a-zx.]`, `^[-a-zx.]$`)
-	f(`**`, `^[^.]*[^.]*$`)
-	f(`a*[de]{x,y}z`, `^a[^.]*[de](?:x|y)z$`)
-	f(`foo{bar`, `^foo\{bar$`)
-	f(`foo{ba,r`, `^foo\{ba,r$`)
-	f(`foo[bar`, `^foo\[bar$`)
-	f(`foo{bar}`, `^foobar$`)
-	f(`foo{bar,,b{{a,b*},z},[x-y]*z}a`, `^foo(?:bar||b(?:(?:a|b[^.]*)|z)|[x-y][^.]*z)a$`)
-}
-
 func TestDateMetricIDCacheSerial(t *testing.T) {
 	c := newDateMetricIDCache()
 	if err := testDateMetricIDCache(c, false); err != nil {
@@ -1854,13 +1827,13 @@ func testCountAllMetricNamesNoExtDB(is *indexSearch, tr TimeRange) int {
 }
 
 func TestStorageRotateIndexDB_AddRows(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	tr := TimeRange{
+		MinTimestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli(),
+		MaxTimestamp: time.Date(2024, 1, 31, 23, 59, 59, 999_999_999, time.UTC).UnixMilli(),
+	}
+	mrs := testGenerateMetricRowsWithPrefix(rng, 1000, "metric", tr)
 	op := func(s *Storage) {
-		rng := rand.New(rand.NewSource(1))
-		tr := TimeRange{
-			MinTimestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli(),
-			MaxTimestamp: time.Date(2024, 1, 31, 23, 59, 59, 999_999_999, time.UTC).UnixMilli(),
-		}
-		mrs := testGenerateMetricRowsWithPrefix(rng, 1000, "metric", tr)
 		s.AddRows(mrs, defaultPrecisionBits)
 		s.DebugFlush()
 	}
@@ -1869,13 +1842,13 @@ func TestStorageRotateIndexDB_AddRows(t *testing.T) {
 }
 
 func TestStorageRotateIndexDB_RegisterMetricNames(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	tr := TimeRange{
+		MinTimestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli(),
+		MaxTimestamp: time.Date(2024, 1, 31, 23, 59, 59, 999_999_999, time.UTC).UnixMilli(),
+	}
+	mrs := testGenerateMetricRowsWithPrefix(rng, 1000, "metric", tr)
 	op := func(s *Storage) {
-		rng := rand.New(rand.NewSource(1))
-		tr := TimeRange{
-			MinTimestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli(),
-			MaxTimestamp: time.Date(2024, 1, 31, 23, 59, 59, 999_999_999, time.UTC).UnixMilli(),
-		}
-		mrs := testGenerateMetricRowsWithPrefix(rng, 1000, "metric", tr)
 		s.RegisterMetricNames(nil, mrs)
 		s.DebugFlush()
 	}
