@@ -38,6 +38,7 @@ where you can chat with VictoriaMetrics users to get additional references, revi
 - [Roblox](#roblox)
 - [Sensedia](#sensedia)
 - [Smarkets](#smarkets)
+- [Spotify](#spotify)
 - [Synthesio](#synthesio)
 - [Wedos.com](#wedoscom)
 - [Wix.com](#wixcom)
@@ -463,19 +464,19 @@ VictoriaMetrics has allowed us to extend data retention for our metrics effortle
 
 Across our production VictoriaMetrics clusters, in a 12 months period we go beyond the following figures.
 
-- Active time series: 20M
+- Active time series: 25M
 - Ingestion rate: 1M samples per second (2M before stream aggregation)
-- Total number of datapoints: 15T+
-- Data size on disk: 12+ TiB
-- Available memory: 1.2 TiB as seen by kubernetes (640 GiB physical memory for the hosts)
-- CPU: 80 cores (AMD EPYC 7763), about 50 % idle
+- Total number of datapoints: ~20T
+- Data size on disk: ~20 TiB
+- Available memory: ~2 TiB as seen by kubernetes (1024 GiB physical memory for the hosts)
+- CPU: 128 cores (AMD EPYC 9004), about 60 % idle
 - Retention period: ~1 year
 - Churn rate: 16M new time series per day (monthly average)
 - Query rate:
-  - `/api/v1/query_range`: 15 queries per second
-  - `/api/v1/query`: 10 queries per second
+  - `/api/v1/query_range`: 6 queries per second
+  - `/api/v1/query`: 20 queries per second
 - Query duration for `/api/v1/query_range` (weekly mean):
-  - 99th percentile: 1.5 s
+  - 99th percentile: 2 s
   - median: 15 ms
 
 ## Roblox
@@ -519,7 +520,7 @@ See more details [in this article](https://www.datanami.com/2023/05/30/why-roblo
 
 > Our initial requirements for monitoring solution: the metrics must be stored for 15 days, the solution must be scalable and must offer high availability of the metrics. It must being integrated into Grafana and allowing the use of PromQL when creating/editing dashboards in Grafana to obtain metrics from the Prometheus datasource. The solution also needs to receive data from Prometheus using HTTPS and needs to request a login and password to write/read the metrics. Details are available [in this article](https://nordicapis.com/api-monitoring-with-prometheus-grafana-alertmanager-and-victoriametrics/).
 
-> We evaluated VictoriaMetrics, InfluxDB OpenSource and Enterprise, Elasticsearch, Thanos, Cortex, TimescaleDB/PostgreSQL and M3DB. We selected VictoriaMetrics because it has [good community support](https://slack.victoriametrics.com/), [good documentation](https://docs.victoriametrics.com/) and it just works.
+> We evaluated VictoriaMetrics, InfluxDB OpenSource and Enterprise, Elasticsearch, Thanos, Cortex, TimescaleDB/PostgreSQL and M3DB. We selected VictoriaMetrics because it has [good community support](https://slack.victoriametrics.com/), [good documentation](https://docs.victoriametrics.com/victoriametrics/) and it just works.
 
 > We started using VictoriaMetrics in the production environment days before the start of BlackFriday in 2020, the period of greatest use of the Sensedia API-Platform by customers. There was a record in the generation of metrics and there was no instability with the monitoring stack.
 
@@ -553,6 +554,41 @@ Numbers:
 > We selected Victoria Metrics. Our new architecture has been very stable since it was put into production. With the previous setup we would have had two or three cardinality explosions in a two-week period, with this new one we have none.
 
 See [the full article](https://smarketshq.com/monitoring-kubernetes-clusters-41a4b24c19e3).
+
+## Spotify
+
+[Spotify](https://spotify.com/) is the largest provider of music streaming services.
+
+Spotify was using an internally developed observability system - [Heroic](https://spotify.github.io/heroic/docs/overview).
+This system had performance and scalability issues, so they started searching for the replacement, which satisfies the following requirements:
+
+- Low latency for data ingestion, querying and alerts
+- Open source and aligned with Prometheus ecosystem
+- Cost efficient with low operational overhead
+- Compatible with Grafana and PromQL
+- Scalable alerting
+- Active community
+
+Five different solutions matching these requirements were evaluated, and VictoriaMetrics was selected
+as a clear winner after running a proof of concept for a production-like workload on these solutions.
+
+The migration from Heroic to VictoriaMetrics was very smooth across internal teams at Spotify
+who relied on the observability provided by Heroic. Here are some quotes from these teams after the migration is complete:
+
+> What strikes me is how fast our panels load. Looking at the time span over 6 hours
+> with high granularity was impossible before but is now doable with the new platform.
+
+> I'm loving the new Grafana. Feels faster and more up-to-date on features.
+
+> This graph is the most beatiful thing I've seen in a long while. It's been literally years since I've seen something like that!
+
+Migration results:
+
+- 10x faster queries
+- Significant cost savings
+- Improved dashboards, more accurate metrics and alerts
+
+See [the talk from the observability team at Spotify](https://www.youtube.com/watch?v=87koDlpKDR4).
 
 ## Synthesio
 
@@ -690,4 +726,4 @@ To address these challenges, we decided to migrate to VictoriaMetrics. We were d
 
 Post-migration, we successfully scaled our monitoring infrastructure to handle billions of data points daily, all while experiencing faster query performance and 60% reduction in yearly infra cost. The improved observability has enhanced our ability to deliver reliable service, allowing us to troubleshoot issues more quickly and effectively.
 
-Read more about the migration journey in our blog - https://blog.zomato.com/migrating-to-victoriametrics-a-complete-overhaul-for-enhanced-observability
+Read more about the migration journey in our blog - [https://blog.zomato.com/migrating-to-victoriametrics-a-complete-overhaul-for-enhanced-observability](https://blog.zomato.com/migrating-to-victoriametrics-a-complete-overhaul-for-enhanced-observability)

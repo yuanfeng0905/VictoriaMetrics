@@ -198,8 +198,8 @@ func templateFuncs() textTpl.FuncMap {
 		// It is better to use quotesEscape, jsonEscape, queryEscape or pathEscape instead -
 		// these functions properly escape `\n` and `\r` chars according to their purpose.
 		"crlfEscape": func(q string) string {
-			q = strings.Replace(q, "\n", `\n`, -1)
-			return strings.Replace(q, "\r", `\r`, -1)
+			q = strings.ReplaceAll(q, "\n", `\n`)
+			return strings.ReplaceAll(q, "\r", `\r`)
 		},
 
 		// quotesEscape escapes the string, so it can be safely put inside JSON string.
@@ -484,6 +484,12 @@ func templateFuncs() textTpl.FuncMap {
 		},
 
 		/* Helpers */
+
+		// now returns the Unix timestamp in seconds at the time of the template evaluation.
+		// For example: {{ (now | toTime).Sub $activeAt }} will return the duration the alert has been active.
+		"now": func() float64 {
+			return float64(time.Now().Unix())
+		},
 
 		// Converts a list of objects to a map with keys arg0, arg1 etc.
 		// This is intended to allow multiple arguments to be passed to templates.

@@ -59,7 +59,7 @@ var (
 		"Returns non-zero exit code on parsing errors and emits these errors to stderr. "+
 		"See also -promscrape.config.strictParse command-line flag. "+
 		"Pass -loggerLevel=ERROR if you don't need to see info messages in the output.")
-	dropOriginalLabels = flag.Bool("promscrape.dropOriginalLabels", false, "Whether to drop original labels for scrape targets at /targets and /api/v1/targets pages. "+
+	dropOriginalLabels = flag.Bool("promscrape.dropOriginalLabels", true, "Whether to drop original labels for scrape targets at /targets and /api/v1/targets pages. "+
 		"This may be needed for reducing memory usage when original labels for big number of scrape targets occupy big amounts of memory. "+
 		"Note that this reduces debuggability for improper per-target relabeling configs")
 	clusterMembersCount = flag.Int("promscrape.cluster.membersCount", 1, "The number of members in a cluster of scrapers. "+
@@ -121,19 +121,15 @@ type Config struct {
 }
 
 func (cfg *Config) unmarshal(data []byte, isStrict bool) error {
-	var err error
-	data, err = envtemplate.ReplaceBytes(data)
-	if err != nil {
-		return fmt.Errorf("cannot expand environment variables: %w", err)
+	data = envtemplate.ReplaceBytes(data)
+	if !isStrict {
+		return yaml.Unmarshal(data, cfg)
 	}
-	if isStrict {
-		if err = yaml.UnmarshalStrict(data, cfg); err != nil {
-			err = fmt.Errorf("%w; pass -promscrape.config.strictParse=false command-line flag for ignoring unknown fields in yaml config", err)
-		}
-	} else {
-		err = yaml.Unmarshal(data, cfg)
+
+	if err := yaml.UnmarshalStrict(data, cfg); err != nil {
+		return fmt.Errorf("%w; pass -promscrape.config.strictParse=false command-line flag for ignoring unknown fields in yaml config", err)
 	}
-	return err
+	return nil
 }
 
 func (cfg *Config) marshal() []byte {
@@ -441,10 +437,7 @@ func loadStaticConfigs(path string) ([]StaticConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read `static_configs` from %q: %w", path, err)
 	}
-	data, err = envtemplate.ReplaceBytes(data)
-	if err != nil {
-		return nil, fmt.Errorf("cannot expand environment vars in %q: %w", path, err)
-	}
+	data = envtemplate.ReplaceBytes(data)
 	var stcs []StaticConfig
 	if err := yaml.UnmarshalStrict(data, &stcs); err != nil {
 		return nil, fmt.Errorf("cannot unmarshal `static_configs` from %q: %w", path, err)
@@ -485,11 +478,7 @@ func loadScrapeConfigFiles(baseDir string, scrapeConfigFiles []string, isStrict 
 				logger.Errorf("skipping %q at `scrape_config_files` because of error: %s", path, err)
 				continue
 			}
-			data, err = envtemplate.ReplaceBytes(data)
-			if err != nil {
-				logger.Errorf("skipping %q at `scrape_config_files` because of failure to expand environment vars: %s", path, err)
-				continue
-			}
+			data = envtemplate.ReplaceBytes(data)
 			var scs []*ScrapeConfig
 			if isStrict {
 				if err = yaml.UnmarshalStrict(data, &scs); err != nil {
@@ -834,20 +823,23 @@ func (cfg *Config) getScrapeWorkGeneric(visitConfigs func(sc *ScrapeConfig, visi
 	dst := make([]*ScrapeWork, 0, len(prev))
 	for _, sc := range cfg.ScrapeConfigs {
 		dstLen := len(dst)
-		ok := true
+
+		// hasSuccess indicates that at least one xxxSDConfig in the []*xxxSDConfig list has returned a successful response.
+		// Therefore, the service discovery result should be updated based on the current round of results.
+		//
+		// If no successful response is received (i.e., hasSuccess is false), fall back to the result from the previous round.
+		hasSuccess := false
 		visitConfigs(sc, func(sdc targetLabelsGetter) {
-			if !ok {
-				return
-			}
 			targetLabels, err := sdc.GetLabels(cfg.baseDir)
 			if err != nil {
-				logger.Errorf("skipping %s targets for job_name=%s because of error: %s", discoveryType, sc.swc.jobName, err)
-				ok = false
+				logger.Errorf("skipping some %s targets for job_name=%s because of error: %s", discoveryType, sc.swc.jobName, err)
+				hasSuccess = hasSuccess || false
 				return
 			}
+			hasSuccess = true
 			dst = appendScrapeWorkForTargetLabels(dst, sc.swc, targetLabels, discoveryType)
 		})
-		if !ok {
+		if !hasSuccess {
 			dst = sc.appendPrevTargets(dst[:dstLen], swsPrevByJob, discoveryType)
 		}
 	}

@@ -10,42 +10,24 @@ const getProxy = (): Record<string, ProxyOptions> | undefined => {
   switch (playground) {
     case "METRICS": {
       return {
-        "^/vmalert/.*": {
-          target: "https://play.victoriametrics.com",
+        "^/(api|vmalert)/.*": {
+          target: "https://play.victoriametrics.com/select/0/prometheus",
           changeOrigin: true,
           configure: (proxy) => {
             proxy.on("error", (err) => {
               console.error("[proxy error]", err.message);
             });
-          }
+          },
         },
-        "^/api/.*": {
-          target: "https://play.victoriametrics.com/select/0/prometheus/",
+        "/vmui/config.json": {
+          target: "https://play.victoriametrics.com/select/0",
           changeOrigin: true,
           configure: (proxy) => {
             proxy.on("error", (err) => {
               console.error("[proxy error]", err.message);
             });
-          }
-        }
-      };
-    }
-    case "LOGS": {
-      return {
-        "^/select/.*": {
-          target: "https://play-vmlogs.victoriametrics.com",
-          changeOrigin: true,
-          configure: (proxy) => {
-            proxy.on("proxyReq", (proxyReq) => {
-              proxyReq.removeHeader("AccountID");
-              proxyReq.removeHeader("ProjectID");
-            });
-
-            proxy.on("error", (err) => {
-              console.error("[proxy error]", err.message);
-            });
-          }
-        }
+          },
+        },
       };
     }
     default: {
@@ -57,10 +39,7 @@ const getProxy = (): Record<string, ProxyOptions> | undefined => {
 export default defineConfig(({ mode }) => {
   return {
     base: "",
-    plugins: [
-      preact(),
-      dynamicIndexHtmlPlugin({ mode })
-    ],
+    plugins: [preact(), dynamicIndexHtmlPlugin({ mode })],
     assetsInclude: ["**/*.md"],
     server: {
       open: true,
@@ -69,7 +48,7 @@ export default defineConfig(({ mode }) => {
     },
     resolve: {
       alias: {
-        "src": path.resolve(__dirname, "src"),
+        src: path.resolve(__dirname, "src"),
       },
     },
     build: {
@@ -80,12 +59,9 @@ export default defineConfig(({ mode }) => {
             if (id.includes("node_modules")) {
               return "vendor";
             }
-          }
-        }
-      }
+          },
+        },
+      },
     },
   };
 });
-
-
-

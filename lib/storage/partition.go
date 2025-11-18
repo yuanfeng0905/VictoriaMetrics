@@ -188,12 +188,11 @@ func (pw *partWrapper) decRef() {
 	pw.p = nil
 
 	if deletePath != "" {
-		fs.MustRemoveAll(deletePath)
+		fs.MustRemoveDir(deletePath)
 	}
 }
 
-// mustCreatePartition creates new partition for the given timestamp and the given paths
-// to small and big partitions.
+// mustCreatePartition creates new partition for the given timestamp and the given paths to small and big partitions.
 func mustCreatePartition(timestamp int64, smallPartitionsPath, bigPartitionsPath string, s *Storage) *partition {
 	name := timestampToPartitionName(timestamp)
 	smallPartsPath := filepath.Join(filepath.Clean(smallPartitionsPath), name)
@@ -207,6 +206,9 @@ func mustCreatePartition(timestamp int64, smallPartitionsPath, bigPartitionsPath
 	tr.fromPartitionTimestamp(timestamp)
 
 	pt := newPartition(name, smallPartsPath, bigPartsPath, tr, s)
+
+	fs.MustSyncPathAndParentDir(smallPartsPath)
+	fs.MustSyncPathAndParentDir(bigPartsPath)
 
 	pt.startBackgroundWorkers()
 
@@ -232,8 +234,8 @@ func (pt *partition) startBackgroundWorkers() {
 func (pt *partition) Drop() {
 	logger.Infof("dropping partition %q at smallPartsPath=%q, bigPartsPath=%q", pt.name, pt.smallPartsPath, pt.bigPartsPath)
 
-	fs.MustRemoveDirAtomic(pt.smallPartsPath)
-	fs.MustRemoveDirAtomic(pt.bigPartsPath)
+	fs.MustRemoveDir(pt.smallPartsPath)
+	fs.MustRemoveDir(pt.bigPartsPath)
 	logger.Infof("partition %q has been dropped", pt.name)
 }
 
@@ -241,6 +243,10 @@ func (pt *partition) Drop() {
 func mustOpenPartition(smallPartsPath, bigPartsPath string, s *Storage) *partition {
 	smallPartsPath = filepath.Clean(smallPartsPath)
 	bigPartsPath = filepath.Clean(bigPartsPath)
+
+	// Create paths to parts if they are missing.
+	fs.MustMkdirIfNotExist(smallPartsPath)
+	fs.MustMkdirIfNotExist(bigPartsPath)
 
 	name := filepath.Base(smallPartsPath)
 	var tr TimeRange
@@ -267,6 +273,9 @@ func mustOpenPartition(smallPartsPath, bigPartsPath string, s *Storage) *partiti
 	pt := newPartition(name, smallPartsPath, bigPartsPath, tr, s)
 	pt.smallParts = smallParts
 	pt.bigParts = bigParts
+
+	fs.MustSyncPathAndParentDir(smallPartsPath)
+	fs.MustSyncPathAndParentDir(bigPartsPath)
 
 	pt.startBackgroundWorkers()
 
@@ -937,9 +946,15 @@ func (pt *partition) MustClose() {
 
 	for _, pw := range smallParts {
 		pw.decRef()
+		if refCount := pw.refCount.Load(); refCount != 0 {
+			logger.Panicf("BUG: unexpected non-zero refCount: %d", refCount)
+		}
 	}
 	for _, pw := range bigParts {
 		pw.decRef()
+		if refCount := pw.refCount.Load(); refCount != 0 {
+			logger.Panicf("BUG: unexpected non-zero refCount: %d", refCount)
+		}
 	}
 }
 
@@ -1438,6 +1453,7 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFi
 		bsw.MustInitFromFilePart(dstPartPath, nocache, compressLevel)
 	}
 
+	// Merge source parts to destination part.
 	ph, err := pt.mergePartsInternal(dstPartPath, bsw, bsrs, dstPartType, stopCh, currentTimestamp, useSparseCache)
 	putBlockStreamWriter(bsw)
 	for _, bsr := range bsrs {
@@ -1451,7 +1467,7 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFi
 		mpNew.ph = *ph
 	} else {
 		// Make sure the created part directory listing is synced.
-		fs.MustSyncPath(dstPartPath)
+		fs.MustSyncPathAndParentDir(dstPartPath)
 	}
 
 	// Atomically swap the source parts with the newly created part.
@@ -1577,8 +1593,9 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
 	}
 	retentionDeadline := currentTimestamp - pt.s.retentionMsecs
 	activeMerges.Add(1)
+	_ = useSparseCache // unused in OSS version.
 	dmis := pt.s.getDeletedMetricIDs()
-	err := mergeBlockStreams(&ph, bsw, bsrs, stopCh, dmis, retentionDeadline, rowsMerged, rowsDeleted, useSparseCache)
+	err := mergeBlockStreams(&ph, bsw, bsrs, stopCh, dmis, retentionDeadline, rowsMerged, rowsDeleted)
 	activeMerges.Add(-1)
 	mergesCount.Add(1)
 	if err != nil {
@@ -1596,7 +1613,7 @@ func (pt *partition) openCreatedPart(ph *partHeader, pws []*partWrapper, mpNew *
 	if ph.RowsCount == 0 {
 		// The created part is empty. Remove it
 		if mpNew == nil {
-			fs.MustRemoveAll(dstPartPath)
+			fs.MustRemoveDir(dstPartPath)
 		}
 		return nil
 	}
@@ -1917,14 +1934,10 @@ func getPartsSize(pws []*partWrapper) uint64 {
 }
 
 func mustOpenParts(partsFile, path string, partNames []string) []*partWrapper {
-	// The path can be missing after restoring from backup, so create it if needed.
-	fs.MustMkdirIfNotExist(path)
-	fs.MustRemoveTemporaryDirs(path)
-
 	// Remove txn and tmp directories, which may be left after the upgrade
 	// to v1.90.0 and newer versions.
-	fs.MustRemoveAll(filepath.Join(path, "txn"))
-	fs.MustRemoveAll(filepath.Join(path, "tmp"))
+	fs.MustRemoveDir(filepath.Join(path, "txn"))
+	fs.MustRemoveDir(filepath.Join(path, "tmp"))
 
 	// Remove dirs missing in partNames. These dirs may be left after unclean shutdown
 	// or after the update from versions prior to v1.90.0.
@@ -1938,8 +1951,8 @@ func mustOpenParts(partsFile, path string, partNames []string) []*partWrapper {
 		partPath := filepath.Join(path, partName)
 		if !fs.IsPathExist(partPath) {
 			logger.Panicf("FATAL: part %q is listed in %q, but is missing on disk; "+
-				"ensure %q contents is not corrupted; remove %q to rebuild its content from the list of existing parts",
-				partPath, partsFile, partsFile, partsFile)
+				"ensure %q contents is not corrupted; remove %q from %q in order to restore access to the remaining data",
+				partPath, partsFile, partsFile, partPath, partsFile)
 		}
 
 		m[partName] = struct{}{}
@@ -1953,10 +1966,9 @@ func mustOpenParts(partsFile, path string, partNames []string) []*partWrapper {
 		if _, ok := m[fn]; !ok {
 			deletePath := filepath.Join(path, fn)
 			logger.Infof("deleting %q because it isn't listed in %q; this is the expected case after unclean shutdown", deletePath, partsFile)
-			fs.MustRemoveAll(deletePath)
+			fs.MustRemoveDir(deletePath)
 		}
 	}
-	fs.MustSyncPath(path)
 
 	// Open parts
 	var pws []*partWrapper
@@ -2004,6 +2016,9 @@ func (pt *partition) MustCreateSnapshotAt(smallPath, bigPath string) {
 	pt.mustCreateSnapshot(pt.smallPartsPath, smallPath, pwsSmall)
 	pt.mustCreateSnapshot(pt.bigPartsPath, bigPath, pwsBig)
 
+	fs.MustSyncPathAndParentDir(smallPath)
+	fs.MustSyncPathAndParentDir(bigPath)
+
 	logger.Infof("created partition snapshot of %q and %q at %q and %q in %.3f seconds",
 		pt.smallPartsPath, pt.bigPartsPath, smallPath, bigPath, time.Since(startTime).Seconds())
 }
@@ -2026,10 +2041,6 @@ func (pt *partition) mustCreateSnapshot(srcDir, dstDir string, pws []*partWrappe
 		dstPath := filepath.Join(dstDir, filepath.Base(srcPath))
 		fs.MustCopyFile(srcPath, dstPath)
 	}
-
-	fs.MustSyncPath(dstDir)
-	parentDir := filepath.Dir(dstDir)
-	fs.MustSyncPath(parentDir)
 }
 
 type partNamesJSON struct {
@@ -2107,5 +2118,5 @@ func mustReadPartNamesFromDir(srcDir string) []string {
 }
 
 func isSpecialDir(name string) bool {
-	return name == "tmp" || name == "txn" || name == snapshotsDirname || fs.IsScheduledForRemoval(name)
+	return name == "tmp" || name == "txn" || name == snapshotsDirname
 }

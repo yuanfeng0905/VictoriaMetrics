@@ -3,16 +3,18 @@ package apptest
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang/snappy"
 
-	pb "github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 )
 
 // Vmsingle holds the state of a vmsingle app and provides vmsingle-specific
@@ -46,7 +48,7 @@ type Vmsingle struct {
 // StartVmsingleAt starts an instance of vmsingle with the given flags. It also
 // sets the default flags and populates the app instance state with runtime
 // values extracted from the application log (such as httpListenAddr).
-func StartVmsingleAt(instance, binary string, flags []string, cli *Client) (*Vmsingle, error) {
+func StartVmsingleAt(instance, binary string, flags []string, cli *Client, output io.Writer) (*Vmsingle, error) {
 	app, stderrExtracts, err := startApp(instance, binary, flags, &appOptions{
 		defaultFlags: map[string]string{
 			"-storageDataPath":    fmt.Sprintf("%s/%s-%d", os.TempDir(), instance, time.Now().UnixNano()),
@@ -60,6 +62,7 @@ func StartVmsingleAt(instance, binary string, flags []string, cli *Client) (*Vms
 			graphiteListenAddrRE,
 			openTSDBListenAddrRE,
 		},
+		output: output,
 	})
 	if err != nil {
 		return nil, err
@@ -209,10 +212,9 @@ func (app *Vmsingle) OpenTSDBAPIPut(t *testing.T, records []string, opts QueryOp
 // PrometheusAPIV1Write is a test helper function that inserts a
 // collection of records in Prometheus remote-write format by sending a HTTP
 // POST request to /prometheus/api/v1/write vmsingle endpoint.
-func (app *Vmsingle) PrometheusAPIV1Write(t *testing.T, records []pb.TimeSeries, _ QueryOpts) {
+func (app *Vmsingle) PrometheusAPIV1Write(t *testing.T, wr prompb.WriteRequest, _ QueryOpts) {
 	t.Helper()
 
-	wr := pb.WriteRequest{Timeseries: records}
 	data := snappy.Encode(nil, wr.MarshalProtobuf(nil))
 	_, statusCode := app.cli.Post(t, app.prometheusAPIV1WriteURL, "application/x-protobuf", data)
 	if statusCode != http.StatusNoContent {
@@ -316,6 +318,64 @@ func (app *Vmsingle) PrometheusAPIV1Series(t *testing.T, matchQuery string, opts
 
 	res, _ := app.cli.PostForm(t, app.prometheusAPIV1SeriesURL, values)
 	return NewPrometheusAPIV1SeriesResponse(t, res)
+}
+
+// PrometheusAPIV1SeriesCount sends a query to a /prometheus/api/v1/series/count endpoint
+// and returns the total number of time series.
+//
+// See https://docs.victoriametrics.com/victoriametrics/url-examples/#apiv1series
+func (app *Vmsingle) PrometheusAPIV1SeriesCount(t *testing.T, opts QueryOpts) *PrometheusAPIV1SeriesCountResponse {
+	t.Helper()
+
+	values := opts.asURLValues()
+
+	queryURL := fmt.Sprintf("http://%s/prometheus/api/v1/series/count", app.httpListenAddr)
+	res, _ := app.cli.PostForm(t, queryURL, values)
+	return NewPrometheusAPIV1SeriesCountResponse(t, res)
+}
+
+// PrometheusAPIV1Labels sends a query to a /prometheus/api/v1/labels endpoint
+// and returns the label names list of time series that match the query.
+//
+// See https://docs.victoriametrics.com/victoriametrics/url-examples/#apiv1labels
+func (app *Vmsingle) PrometheusAPIV1Labels(t *testing.T, matchQuery string, opts QueryOpts) *PrometheusAPIV1LabelsResponse {
+	t.Helper()
+
+	values := opts.asURLValues()
+	values.Add("match[]", matchQuery)
+
+	queryURL := fmt.Sprintf("http://%s/prometheus/api/v1/labels", app.httpListenAddr)
+	res, _ := app.cli.PostForm(t, queryURL, values)
+	return NewPrometheusAPIV1LabelsResponse(t, res)
+}
+
+// PrometheusAPIV1LabelValues sends a query to a /prometheus/api/v1/label/.../values endpoint
+// and returns the label names list of time series that match the query.
+//
+// See https://docs.victoriametrics.com/victoriametrics/url-examples/#apiv1labelvalues
+func (app *Vmsingle) PrometheusAPIV1LabelValues(t *testing.T, labelName, matchQuery string, opts QueryOpts) *PrometheusAPIV1LabelValuesResponse {
+	t.Helper()
+
+	values := opts.asURLValues()
+	values.Add("match[]", matchQuery)
+
+	queryURL := fmt.Sprintf("http://%s/prometheus/api/v1/label/%s/values", app.httpListenAddr, labelName)
+	res, _ := app.cli.PostForm(t, queryURL, values)
+	return NewPrometheusAPIV1LabelValuesResponse(t, res)
+}
+
+// PrometheusAPIV1Metadata sends a query to a /prometheus/api/v1/metadata endpoint
+// and returns the results.
+func (app *Vmsingle) PrometheusAPIV1Metadata(t *testing.T, metric string, limit int, opts QueryOpts) *PrometheusAPIV1Metadata {
+	t.Helper()
+
+	values := opts.asURLValues()
+	values.Add("metric", metric)
+	values.Add("limit", strconv.Itoa(limit))
+	queryURL := fmt.Sprintf("http://%s/prometheus/api/v1/metadata", app.httpListenAddr)
+
+	res, _ := app.cli.PostForm(t, queryURL, values)
+	return NewPrometheusAPIV1Metadata(t, res)
 }
 
 // APIV1AdminTSDBDeleteSeries deletes the series that match the query by sending

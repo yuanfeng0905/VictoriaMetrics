@@ -1,12 +1,14 @@
 package prometheusimport
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prommetadata"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus/stream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil"
@@ -14,8 +16,9 @@ import (
 )
 
 var (
-	rowsInserted  = metrics.NewCounter(`vm_rows_inserted_total{type="prometheus"}`)
-	rowsPerInsert = metrics.NewHistogram(`vm_rows_per_insert{type="prometheus"}`)
+	rowsInserted     = metrics.NewCounter(`vm_rows_inserted_total{type="prometheus"}`)
+	rowsPerInsert    = metrics.NewHistogram(`vm_rows_per_insert{type="prometheus"}`)
+	metadataInserted = metrics.NewCounter(`vm_metadata_rows_inserted_total{type="prometheus"}`)
 )
 
 // InsertHandler processes `/api/v1/import/prometheus` request.
@@ -29,14 +32,14 @@ func InsertHandler(req *http.Request) error {
 		return err
 	}
 	encoding := req.Header.Get("Content-Encoding")
-	return stream.Parse(req.Body, defaultTimestamp, encoding, true, func(rows []prometheus.Row) error {
-		return insertRows(rows, extraLabels)
+	return stream.Parse(req.Body, defaultTimestamp, encoding, true, prommetadata.IsEnabled(), func(rows []prometheus.Row, mms []prometheus.Metadata) error {
+		return insertRows(rows, mms, extraLabels)
 	}, func(s string) {
 		httpserver.LogError(req, s)
 	})
 }
 
-func insertRows(rows []prometheus.Row, extraLabels []prompbmarshal.Label) error {
+func insertRows(rows []prometheus.Row, mms []prometheus.Metadata, extraLabels []prompb.Label) error {
 	ctx := common.GetInsertCtx()
 	defer common.PutInsertCtx(ctx)
 
@@ -63,5 +66,15 @@ func insertRows(rows []prometheus.Row, extraLabels []prompbmarshal.Label) error 
 	}
 	rowsInserted.Add(len(rows))
 	rowsPerInsert.Update(float64(len(rows)))
-	return ctx.FlushBufs()
+	if err := ctx.FlushBufs(); err != nil {
+		return fmt.Errorf("cannot flush metric bufs: %w", err)
+	}
+
+	if prommetadata.IsEnabled() {
+		if err := ctx.WritePromMetadata(mms); err != nil {
+			return err
+		}
+		metadataInserted.Add(len(mms))
+	}
+	return nil
 }

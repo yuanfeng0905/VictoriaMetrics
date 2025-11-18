@@ -1,4 +1,4 @@
-import React, { FC } from "preact/compat";
+import { FC } from "preact/compat";
 import "./style.scss";
 import Switch from "../../Main/Switch/Switch";
 import Tooltip from "../../Main/Tooltip/Tooltip";
@@ -106,7 +106,7 @@ const ExploreMetricItemHeader: FC<ExploreMetricItemControlsProps> = ({
                 onClick={handleClickRemove}
                 fullWidth
               >
-                  Remove graph
+                Remove graph
               </Button>
             </div>
           </Modal>

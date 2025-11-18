@@ -1,11 +1,8 @@
 package apptest
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net/url"
 	"slices"
@@ -15,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 )
 
 // PrometheusQuerier contains methods available to Prometheus-like HTTP API for Querying
@@ -24,7 +21,11 @@ type PrometheusQuerier interface {
 	PrometheusAPIV1Query(t *testing.T, query string, opts QueryOpts) *PrometheusAPIV1QueryResponse
 	PrometheusAPIV1QueryRange(t *testing.T, query string, opts QueryOpts) *PrometheusAPIV1QueryResponse
 	PrometheusAPIV1Series(t *testing.T, matchQuery string, opts QueryOpts) *PrometheusAPIV1SeriesResponse
+	PrometheusAPIV1SeriesCount(t *testing.T, opts QueryOpts) *PrometheusAPIV1SeriesCountResponse
+	PrometheusAPIV1Labels(t *testing.T, query string, opts QueryOpts) *PrometheusAPIV1LabelsResponse
+	PrometheusAPIV1LabelValues(t *testing.T, labelName, query string, opts QueryOpts) *PrometheusAPIV1LabelValuesResponse
 	PrometheusAPIV1ExportNative(t *testing.T, query string, opts QueryOpts) []byte
+	PrometheusAPIV1Metadata(t *testing.T, metric string, limit int, opts QueryOpts) *PrometheusAPIV1Metadata
 
 	APIV1AdminTSDBDeleteSeries(t *testing.T, matchQuery string, opts QueryOpts)
 
@@ -37,7 +38,7 @@ type PrometheusQuerier interface {
 // Writer contains methods for writing new data
 type Writer interface {
 	// Prometheus APIs
-	PrometheusAPIV1Write(t *testing.T, records []pb.TimeSeries, opts QueryOpts)
+	PrometheusAPIV1Write(t *testing.T, wr prompb.WriteRequest, opts QueryOpts)
 	PrometheusAPIV1ImportPrometheus(t *testing.T, records []string, opts QueryOpts)
 	PrometheusAPIV1ImportCSV(t *testing.T, records []string, opts QueryOpts)
 	PrometheusAPIV1ImportNative(t *testing.T, data []byte, opts QueryOpts)
@@ -281,6 +282,102 @@ func (r *PrometheusAPIV1SeriesResponse) Sort() *PrometheusAPIV1SeriesResponse {
 	return r
 }
 
+// PrometheusAPIV1SeriesCountResponse is an inmemory representation of the
+// /prometheus/api/v1/series/count response.
+type PrometheusAPIV1SeriesCountResponse struct {
+	Status    string
+	IsPartial bool
+	Data      []uint64
+	Trace     *Trace
+	ErrorType string
+	Error     string
+}
+
+// NewPrometheusAPIV1SeriesCountResponse is a test helper function that creates a new
+// instance of PrometheusAPIV1SeriesCountResponse by unmarshalling a json string.
+func NewPrometheusAPIV1SeriesCountResponse(t *testing.T, s string) *PrometheusAPIV1SeriesCountResponse {
+	t.Helper()
+
+	res := &PrometheusAPIV1SeriesCountResponse{}
+	if err := json.Unmarshal([]byte(s), res); err != nil {
+		t.Fatalf("could not unmarshal series response data:\n%s\n err: %v", string(s), err)
+	}
+	return res
+}
+
+// PrometheusAPIV1LabelsResponse is an inmemory representation of the
+// /prometheus/api/v1/labels response.
+type PrometheusAPIV1LabelsResponse struct {
+	Status    string
+	IsPartial bool
+	Data      []string
+	Trace     *Trace
+	ErrorType string
+	Error     string
+}
+
+// NewPrometheusAPIV1LabelsResponse is a test helper function that creates a new
+// instance of PrometheusAPIV1LabelsResponse by unmarshalling a json string.
+func NewPrometheusAPIV1LabelsResponse(t *testing.T, s string) *PrometheusAPIV1LabelsResponse {
+	t.Helper()
+
+	res := &PrometheusAPIV1LabelsResponse{}
+	if err := json.Unmarshal([]byte(s), res); err != nil {
+		t.Fatalf("could not unmarshal series response data:\n%s\n err: %v", string(s), err)
+	}
+	return res
+}
+
+// PrometheusAPIV1LabelValuesResponse is an inmemory representation of the
+// /prometheus/api/v1/labels/.../values response.
+type PrometheusAPIV1LabelValuesResponse struct {
+	Status    string
+	IsPartial bool
+	Data      []string
+	Trace     *Trace
+	ErrorType string
+	Error     string
+}
+
+// NewPrometheusAPIV1LabelValuesResponse is a test helper function that creates a new
+// instance of PrometheusAPIV1LabelValuesResponse by unmarshalling a json string.
+func NewPrometheusAPIV1LabelValuesResponse(t *testing.T, s string) *PrometheusAPIV1LabelValuesResponse {
+	t.Helper()
+
+	res := &PrometheusAPIV1LabelValuesResponse{}
+	if err := json.Unmarshal([]byte(s), res); err != nil {
+		t.Fatalf("could not unmarshal series response data:\n%s\n err: %v", string(s), err)
+	}
+	return res
+}
+
+// PrometheusAPIV1Metadata is an inmemory representation of the
+// /prometheus/api/v1/metadata response.
+type PrometheusAPIV1Metadata struct {
+	Status    string
+	IsPartial bool
+	Data      map[string][]MetadataEntry
+	Trace     *Trace
+}
+
+type MetadataEntry struct {
+	Type string
+	Help string
+	Unit string
+}
+
+// NewPrometheusAPIV1Metadata is a test helper function that creates a new
+// instance of PrometheusAPIV1Metadata by unmarshalling a json string.
+func NewPrometheusAPIV1Metadata(t *testing.T, s string) *PrometheusAPIV1Metadata {
+	t.Helper()
+
+	res := &PrometheusAPIV1Metadata{}
+	if err := json.Unmarshal([]byte(s), res); err != nil {
+		t.Fatalf("could not unmarshal series response data:\n%s\n err: %v", string(s), err)
+	}
+	return res
+}
+
 // Trace provides the description and the duration of some unit of work that has
 // been performed during the request processing.
 type Trace struct {
@@ -430,45 +527,4 @@ func sortTSDBStatusResponseEntries(entries []TSDBStatusResponseEntry) {
 		}
 		return left.Count < right.Count
 	})
-}
-
-// LogsQLQueryResponse is an in-memory representation of the
-// /select/logsql/query response.
-type LogsQLQueryResponse struct {
-	LogLines []string
-}
-
-// NewLogsQLQueryResponse is a test helper function that creates a new
-// instance of LogsQLQueryResponse by unmarshalling a json string.
-func NewLogsQLQueryResponse(t *testing.T, s string) *LogsQLQueryResponse {
-	t.Helper()
-	res := &LogsQLQueryResponse{}
-	if len(s) == 0 {
-		return res
-	}
-	bs := bytes.NewBufferString(s)
-	for {
-		logLine, err := bs.ReadString('\n')
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				if len(logLine) > 0 {
-					t.Fatalf("BUG: unexpected non-empty line=%q with io.EOF", logLine)
-				}
-				break
-			}
-			t.Fatalf("BUG: cannot read logline from buffer: %s", err)
-		}
-		var lv map[string]any
-		if err := json.Unmarshal([]byte(logLine), &lv); err != nil {
-			t.Fatalf("cannot parse log line=%q: %s", logLine, err)
-		}
-		delete(lv, "_stream_id")
-		normalizedLine, err := json.Marshal(lv)
-		if err != nil {
-			t.Fatalf("cannot marshal parsed logline=%q: %s", logLine, err)
-		}
-		res.LogLines = append(res.LogLines, string(normalizedLine))
-	}
-
-	return res
 }

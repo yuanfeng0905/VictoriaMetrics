@@ -11,7 +11,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/apptest"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
-	pb "github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 )
 
 func millis(s string) int64 {
@@ -47,14 +47,16 @@ func TestClusterInstantQuery(t *testing.T) {
 }
 
 func testInstantQueryWithUTFNames(t *testing.T, sut apptest.PrometheusWriteQuerier) {
-	data := []pb.TimeSeries{
-		{
-			Labels: []pb.Label{
-				{Name: "__name__", Value: "3fooµ¥"},
-				{Name: "3👋tfにちは", Value: "漢©®€£"},
-			},
-			Samples: []pb.Sample{
-				{Value: 1, Timestamp: millis("2024-01-01T00:01:00Z")},
+	data := prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []prompb.Label{
+					{Name: "__name__", Value: "3fooµ¥"},
+					{Name: "3👋tfにちは", Value: "漢©®€£"},
+				},
+				Samples: []prompb.Sample{
+					{Value: 1, Timestamp: millis("2024-01-01T00:01:00Z")},
+				},
 			},
 		},
 	}
@@ -89,23 +91,25 @@ func testInstantQueryWithUTFNames(t *testing.T, sut apptest.PrometheusWriteQueri
 	fn(`{"3👋tfにちは"="漢©®€£"}`)
 }
 
-var staleNaNsData = func() []pb.TimeSeries {
-	return []pb.TimeSeries{
-		{
-			Labels: []pb.Label{
-				{
-					Name:  "__name__",
-					Value: "metric",
+var staleNaNsData = func() prompb.WriteRequest {
+	return prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []prompb.Label{
+					{
+						Name:  "__name__",
+						Value: "metric",
+					},
 				},
-			},
-			Samples: []pb.Sample{
-				{
-					Value:     1,
-					Timestamp: millis("2024-01-01T00:01:00Z"),
-				},
-				{
-					Value:     decimal.StaleNaN,
-					Timestamp: millis("2024-01-01T00:02:00Z"),
+				Samples: []prompb.Sample{
+					{
+						Value:     1,
+						Timestamp: millis("2024-01-01T00:01:00Z"),
+					},
+					{
+						Value:     decimal.StaleNaN,
+						Timestamp: millis("2024-01-01T00:02:00Z"),
+					},
 				},
 			},
 		},
@@ -185,21 +189,23 @@ func testInstantQueryDoesNotReturnStaleNaNs(t *testing.T, sut apptest.Prometheus
 // However, conversion of math.NaN to int64 could behave differently depending on platform and Go version.
 // Hence, this test could succeed for some platforms even if fix is rolled back.
 func testQueryRangeWithAtModifier(t *testing.T, sut apptest.PrometheusWriteQuerier) {
-	data := []pb.TimeSeries{
-		{
-			Labels: []pb.Label{
-				{Name: "__name__", Value: "up"},
+	data := prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []prompb.Label{
+					{Name: "__name__", Value: "up"},
+				},
+				Samples: []prompb.Sample{
+					{Value: 1, Timestamp: millis("2025-01-01T00:01:00Z")},
+				},
 			},
-			Samples: []pb.Sample{
-				{Value: 1, Timestamp: millis("2025-01-01T00:01:00Z")},
-			},
-		},
-		{
-			Labels: []pb.Label{
-				{Name: "__name__", Value: "metricNaN"},
-			},
-			Samples: []pb.Sample{
-				{Value: decimal.StaleNaN, Timestamp: millis("2025-01-01T00:01:00Z")},
+			{
+				Labels: []prompb.Label{
+					{Name: "__name__", Value: "metricNaN"},
+				},
+				Samples: []prompb.Sample{
+					{Value: decimal.StaleNaN, Timestamp: millis("2025-01-01T00:01:00Z")},
+				},
 			},
 		},
 	}

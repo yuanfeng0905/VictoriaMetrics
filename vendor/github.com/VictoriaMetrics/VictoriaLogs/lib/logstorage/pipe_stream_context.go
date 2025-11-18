@@ -34,7 +34,8 @@ type pipeStreamContext struct {
 	// timeWindow is the time window in nanoseconds for searching for surrounding logs
 	timeWindow int64
 
-	// runQuery and fieldsFilter must be initialized via withRunQuery().
+	// qctx, runQuery and fieldsFilter must be initialized via withRunQuery().
+	qctx         *QueryContext
 	runQuery     runQueryFunc
 	fieldsFilter *prefixfilter.Filter
 }
@@ -64,8 +65,13 @@ func (pc *pipeStreamContext) canLiveTail() bool {
 	return false
 }
 
-func (pc *pipeStreamContext) withRunQuery(runQuery runQueryFunc, fieldsFilter *prefixfilter.Filter) pipe {
+func (pc *pipeStreamContext) canReturnLastNResults() bool {
+	return false
+}
+
+func (pc *pipeStreamContext) withRunQuery(qctx *QueryContext, runQuery runQueryFunc, fieldsFilter *prefixfilter.Filter) pipe {
 	pcNew := *pc
+	pcNew.qctx = qctx
 	pcNew.runQuery = runQuery
 	pcNew.fieldsFilter = fieldsFilter
 	return &pcNew
@@ -316,7 +322,8 @@ func (pcp *pipeStreamContextProcessor) executeQuery(streamID, qStr string, neede
 	if !ok {
 		logger.Panicf("BUG: cannot obtain tenantID from streamID %q", streamID)
 	}
-	if err := pcp.pc.runQuery(ctxWithCancel, []TenantID{tenantID}, q, writeBlock); err != nil {
+	qctx := NewQueryContext(ctxWithCancel, pcp.pc.qctx.QueryStats, []TenantID{tenantID}, q, pcp.pc.qctx.AllowPartialResponse)
+	if err := pcp.pc.runQuery(qctx, writeBlock); err != nil {
 		return nil, 0, err
 	}
 	if stateSize > stateSizeBudget {
@@ -746,7 +753,7 @@ func newDelimiterRowFields(r *streamContextRow, streamID string) []Field {
 		},
 		{
 			Name:  "_stream",
-			Value: getFieldValue(r.fields, "_stream"),
+			Value: getFieldValueByName(r.fields, "_stream"),
 		},
 		{
 			Name:  "_msg",
@@ -832,14 +839,19 @@ func parsePipeStreamContext(lex *lexer) (pipe, error) {
 	timeWindow := pipeStreamContextDefaultTimeWindow
 	if lex.isKeyword("time_window") {
 		lex.nextToken()
-		d, ok := tryParseDuration(lex.token)
+
+		token, err := lex.nextCompoundToken()
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse 'time_window': %w", err)
+		}
+
+		d, ok := tryParseDuration(token)
 		if !ok {
-			return nil, fmt.Errorf("cannot parse 'time_window %s'; it must contain valid duration", lex.token)
+			return nil, fmt.Errorf("cannot parse 'time_window %s'; it must contain valid duration", token)
 		}
 		if timeWindow <= 0 {
-			return nil, fmt.Errorf("'time_window' must be positive; got %s", lex.token)
+			return nil, fmt.Errorf("'time_window' must be positive; got %s", token)
 		}
-		lex.nextToken()
 		timeWindow = d
 	}
 
@@ -867,6 +879,9 @@ func parsePipeStreamContextBeforeAfter(lex *lexer) (int, int, error) {
 			if f < 0 {
 				return 0, 0, fmt.Errorf("'before' value cannot be smaller than 0; got %q", s)
 			}
+			if f > math.MaxInt {
+				return 0, 0, fmt.Errorf("'before' value cannot be bigger than %v; got %v", math.MaxInt, f)
+			}
 			linesBefore = int(f)
 			beforeSet = true
 		case lex.isKeyword("after"):
@@ -877,6 +892,9 @@ func parsePipeStreamContextBeforeAfter(lex *lexer) (int, int, error) {
 			}
 			if f < 0 {
 				return 0, 0, fmt.Errorf("'after' value cannot be smaller than 0; got %q", s)
+			}
+			if f > math.MaxInt {
+				return 0, 0, fmt.Errorf("'after' value cannot be bigger than %v; got %v", math.MaxInt, f)
 			}
 			linesAfter = int(f)
 			afterSet = true

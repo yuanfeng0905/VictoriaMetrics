@@ -1,4 +1,4 @@
-import React, { FC, useEffect, useMemo, useState } from "preact/compat";
+import { FC, useEffect, useMemo, useState } from "preact/compat";
 import { gradMetal16 } from "../../../../utils/uplot";
 import "./style.scss";
 import { ChartTooltipProps } from "../../ChartTooltip/ChartTooltip";
@@ -21,8 +21,9 @@ const LegendHeatmap: FC<LegendHeatmapProps> = ({
   const [maxFormat, setMaxFormat] = useState("");
 
   const value = useMemo(() => {
-    return parseFloat(String(legendValue?.value || 0).replace("%", ""));
-  }, [legendValue]);
+    const n = Number(String(legendValue?.value ?? "").replace("%","").replace(",", "."));
+    return Number.isFinite(n) ? n : 0;
+  }, [legendValue?.value]);
 
   useEffect(() => {
     setPercent(value ? (value - min) / (max - min) * 100 : 0);

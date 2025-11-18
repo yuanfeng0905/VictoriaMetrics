@@ -1,4 +1,3 @@
-import React from "preact/compat";
 import { useSnack } from "../contexts/Snackbar";
 
 type CopyFn = (text: string, msgInfo?: string) => Promise<boolean> // Return success
@@ -62,7 +61,7 @@ const DebugInfoClipboardApi = () => (
             target="_blank"
             rel="noopener noreferrer"
           >
-          Clipboard API documentation
+            Clipboard API documentation
           </a>
         </p>
       </p>

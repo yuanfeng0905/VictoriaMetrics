@@ -1,4 +1,4 @@
-import React, { FC } from "preact/compat";
+import { FC } from "preact/compat";
 import Switch from "../../../Main/Switch/Switch";
 import useDeviceDetect from "../../../../hooks/useDeviceDetect";
 
@@ -20,7 +20,7 @@ const LinesConfigurator: FC<Props> = ({ spanGaps, onChange }) => {
         fullWidth={isMobile}
       />
       <span className="vm-legend-configs-item__info">
-        Connects data points by skipping null values instead of creating gaps.
+        Connects data points by skipping null values instead of gaps.
       </span>
     </div>
   );

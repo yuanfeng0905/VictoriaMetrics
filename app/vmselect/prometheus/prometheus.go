@@ -24,7 +24,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -38,7 +37,6 @@ var (
 	latencyOffset = flag.Duration("search.latencyOffset", time.Second*30, "The time when data points become visible in query results after the collection. "+
 		"It can be overridden on per-query basis via latency_offset arg. "+
 		"Too small value can result in incomplete last points for query results")
-	maxQueryLen = flagutil.NewBytes("search.maxQueryLen", 16*1024, "The maximum search query length in bytes")
 	maxLookback = flag.Duration("search.maxLookback", 0, "Synonym to -query.lookback-delta from Prometheus. "+
 		"The value is dynamically detected from interval between time series datapoints if not set. It can be overridden on per-query basis via max_lookback arg. "+
 		"See also '-search.maxStalenessInterval' flag, which has the same meaning due to historical reasons")
@@ -58,7 +56,7 @@ var (
 	maxTSDBStatusSeries     = flag.Int("search.maxTSDBStatusSeries", 10e6, "The maximum number of time series, which can be processed during the call to /api/v1/status/tsdb. This option allows limiting memory usage")
 	maxSeriesLimit          = flag.Int("search.maxSeries", 30e3, "The maximum number of time series, which can be returned from /api/v1/series. This option allows limiting memory usage")
 	maxDeleteSeries         = flag.Int("search.maxDeleteSeries", 1e6, "The maximum number of time series, which can be deleted using /api/v1/admin/tsdb/delete_series. This option allows limiting memory usage")
-	maxTSDBStatusTopNSeries = flag.Int("search.maxTSDBStatusTopNSeries", 1000, "The maximum value of `topN` argument that can be passed to /api/v1/status/tsdb API. This option allows limiting memory usage. See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#tsdb-stats")
+	maxTSDBStatusTopNSeries = flag.Int("search.maxTSDBStatusTopNSeries", 1000, "The maximum value of 'topN' argument that can be passed to /api/v1/status/tsdb API. This option allows limiting memory usage. See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#tsdb-stats")
 	maxLabelsAPISeries      = flag.Int("search.maxLabelsAPISeries", 1e6, "The maximum number of time series, which could be scanned when searching for the matching time series "+
 		"at /api/v1/labels and /api/v1/label/.../values. This option allows limiting memory usage and CPU usage. See also -search.maxLabelsAPIDuration, "+
 		"-search.maxTagKeys, -search.maxTagValues and -search.ignoreExtraFiltersAtLabelsAPI")
@@ -331,14 +329,15 @@ func exportHandler(qt *querytracer.Tracer, w http.ResponseWriter, cp *commonPara
 		return sw.maybeFlushBuffer(bb)
 	}
 	contentType := "application/stream+json; charset=utf-8"
-	if format == "prometheus" {
+	switch format {
+	case "prometheus":
 		contentType = "text/plain; charset=utf-8"
 		writeLineFunc = func(xb *exportBlock, workerID uint) error {
 			bb := sw.getBuffer(workerID)
 			WriteExportPrometheusLine(bb, xb)
 			return sw.maybeFlushBuffer(bb)
 		}
-	} else if format == "promapi" {
+	case "promapi":
 		WriteExportPromAPIHeader(bw)
 		var firstLineOnce atomic.Bool
 		var firstLineSent atomic.Bool
@@ -640,6 +639,37 @@ func LabelsHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseW
 	return nil
 }
 
+// MetadataHandler processes /api/v1/metadata request.
+//
+// See https://prometheus.io/docs/prometheus/latest/querying/api/#querying-metric-metadata
+func MetadataHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
+
+	limit, err := httputil.GetInt(r, "limit")
+	if err != nil {
+		return err
+	}
+	if limit < 0 {
+		limit = 0
+	}
+
+	metricName := r.FormValue("metric")
+
+	metadata, err := netstorage.GetMetricsMetadata(qt, limit, metricName)
+	if err != nil {
+		return fmt.Errorf("cannot get metadata: %w", err)
+	}
+	qt.Done()
+	w.Header().Set("Content-Type", "application/json")
+	bw := bufferedwriter.Get(w)
+	defer bufferedwriter.Put(bw)
+	WriteMetadataResponse(bw, metadata, qt)
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("cannot send metadata response to remote client: %w", err)
+	}
+
+	return nil
+}
+
 var labelsDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/labels"}`)
 
 // SeriesCountHandler processes /api/v1/series/count request.
@@ -732,8 +762,9 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		step = defaultStep
 	}
 
-	if len(query) > maxQueryLen.IntN() {
-		return fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxQueryLen.N)
+	maxLen := searchutil.GetMaxQueryLen()
+	if len(query) > maxLen {
+		return fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxLen)
 	}
 	etfs, err := searchutil.GetExtraTagFilters(r)
 	if err != nil {
@@ -903,8 +934,9 @@ func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.Respo
 	}
 
 	// Validate input args.
-	if len(query) > maxQueryLen.IntN() {
-		return fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxQueryLen.N)
+	maxLen := searchutil.GetMaxQueryLen()
+	if len(query) > maxLen {
+		return fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxLen)
 	}
 	if start > end {
 		end = start + defaultStep
@@ -1088,12 +1120,9 @@ func getRoundDigits(r *http.Request) int {
 }
 
 func getLatencyOffsetMilliseconds(r *http.Request) (int64, error) {
-	d := latencyOffset.Milliseconds()
-	if d < 0 {
-		// Zero latency offset may be useful for some use cases.
-		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2061#issuecomment-1299109836
-		d = 0
-	}
+	// Zero latency offset may be useful for some use cases.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2061#issuecomment-1299109836
+	d := max(latencyOffset.Milliseconds(), 0)
 	return httputil.GetDuration(r, "latency_offset", d)
 }
 

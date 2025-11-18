@@ -19,7 +19,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/vmalertutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 )
 
@@ -187,6 +187,54 @@ func (ar *AlertingRule) ID() uint64 {
 	return ar.RuleID
 }
 
+// ToAPI returns ApiRule representation of ar
+func (ar *AlertingRule) ToAPI() ApiRule {
+	state := ar.state
+	lastState := state.getLast()
+	r := ApiRule{
+		Type:              TypeAlerting,
+		DatasourceType:    ar.Type.String(),
+		Name:              ar.Name,
+		Query:             ar.Expr,
+		Duration:          ar.For.Seconds(),
+		KeepFiringFor:     ar.KeepFiringFor.Seconds(),
+		Labels:            ar.Labels,
+		Annotations:       ar.Annotations,
+		LastEvaluation:    lastState.Time,
+		EvaluationTime:    lastState.Duration.Seconds(),
+		Health:            "ok",
+		State:             "inactive",
+		Alerts:            ar.AlertsToAPI(),
+		LastSamples:       lastState.Samples,
+		LastSeriesFetched: lastState.SeriesFetched,
+		MaxUpdates:        state.size(),
+		Updates:           state.getAll(),
+		Debug:             ar.Debug,
+
+		// encode as strings to avoid rounding in JSON
+		ID:        fmt.Sprintf("%d", ar.ID()),
+		GroupID:   fmt.Sprintf("%d", ar.GroupID),
+		GroupName: ar.GroupName,
+		File:      ar.File,
+	}
+	if lastState.Err != nil {
+		r.LastError = lastState.Err.Error()
+		r.Health = "err"
+	}
+	// satisfy apiRule.State logic
+	if len(r.Alerts) > 0 {
+		r.State = notifier.StatePending.String()
+		stateFiring := notifier.StateFiring.String()
+		for _, a := range r.Alerts {
+			if a.State == stateFiring {
+				r.State = stateFiring
+				break
+			}
+		}
+	}
+	return r
+}
+
 // GetAlerts returns active alerts of rule
 func (ar *AlertingRule) GetAlerts() []*notifier.Alert {
 	ar.alertsMu.RLock()
@@ -196,16 +244,6 @@ func (ar *AlertingRule) GetAlerts() []*notifier.Alert {
 		alerts = append(alerts, a)
 	}
 	return alerts
-}
-
-// GetAlert returns alert if id exists
-func (ar *AlertingRule) GetAlert(id uint64) *notifier.Alert {
-	ar.alertsMu.RLock()
-	defer ar.alertsMu.RUnlock()
-	if ar.alerts == nil {
-		return nil
-	}
-	return ar.alerts[id]
 }
 
 func (ar *AlertingRule) logDebugf(at time.Time, a *notifier.Alert, format string, args ...any) {
@@ -273,6 +311,11 @@ type labelSet struct {
 // On k conflicts in origin set, the original value is preferred and copied
 // to processed with `exported_%k` key. The copy happens only if passed v isn't equal to origin[k] value.
 func (ls *labelSet) add(k, v string) {
+	// do not add label with empty value, since it has no meaning.
+	// see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/9984
+	if v == "" {
+		return
+	}
 	ls.processed[k] = v
 	ov, ok := ls.origin[k]
 	if !ok {
@@ -307,9 +350,6 @@ func (ar *AlertingRule) toLabels(m datasource.Metric, qFn templates.QueryFn) (*l
 		Value:  m.Values[0],
 		Expr:   ar.Expr,
 	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to expand labels: %w", err)
-	}
 	for k, v := range extraLabels {
 		ls.add(k, v)
 	}
@@ -320,7 +360,7 @@ func (ar *AlertingRule) toLabels(m datasource.Metric, qFn templates.QueryFn) (*l
 	if !*disableAlertGroupLabel && ar.GroupName != "" {
 		ls.add(alertGroupNameLabel, ar.GroupName)
 	}
-	return ls, nil
+	return ls, err
 }
 
 // execRange executes alerting rule on the given time range similarly to exec.
@@ -328,12 +368,12 @@ func (ar *AlertingRule) toLabels(m datasource.Metric, qFn templates.QueryFn) (*l
 // as this function modifies AlertingRule alerts state.
 // It is not thread safe.
 // It returns ALERT and ALERT_FOR_STATE time series as a result.
-func (ar *AlertingRule) execRange(ctx context.Context, start, end time.Time) ([]prompbmarshal.TimeSeries, error) {
+func (ar *AlertingRule) execRange(ctx context.Context, start, end time.Time) ([]prompb.TimeSeries, error) {
 	res, err := ar.q.QueryRange(ctx, ar.Expr, start, end)
 	if err != nil {
 		return nil, err
 	}
-	var result []prompbmarshal.TimeSeries
+	var result []prompb.TimeSeries
 	holdAlertState := make(map[uint64]*notifier.Alert)
 	qFn := func(_ string) ([]datasource.Metric, error) {
 		logger.Warnf("`query` template isn't supported in replay mode, mocked data is used")
@@ -341,11 +381,15 @@ func (ar *AlertingRule) execRange(ctx context.Context, start, end time.Time) ([]
 		return []datasource.Metric{{Timestamps: []int64{0}, Values: []float64{math.NaN()}}}, nil
 	}
 	for _, s := range res.Data {
-		ls, as, err := ar.expandTemplates(s, qFn, time.Time{})
+		ls, err := ar.expandLabelTemplates(s, qFn)
 		if err != nil {
-			return nil, fmt.Errorf("failed to expand templates: %s", err)
+			return nil, err
 		}
 		alertID := hash(ls.processed)
+		as, err := ar.expandAnnotationTemplates(s, qFn, time.Time{}, ls)
+		if err != nil {
+			return nil, err
+		}
 		a := ar.newAlert(s, time.Time{}, ls.processed, as) // initial alert
 
 		prevT := time.Time{}
@@ -363,7 +407,7 @@ func (ar *AlertingRule) execRange(ctx context.Context, start, end time.Time) ([]
 				a.State = notifier.StatePending
 				a.ActiveAt = at
 				// re-template the annotations as active timestamp is changed
-				_, a.Annotations, _ = ar.expandTemplates(s, qFn, at)
+				a.Annotations, _ = ar.expandAnnotationTemplates(s, qFn, at, ls)
 				a.Start = time.Time{}
 			} else if at.Sub(a.ActiveAt) >= ar.For && a.State != notifier.StateFiring {
 				a.State = notifier.StateFiring
@@ -376,13 +420,15 @@ func (ar *AlertingRule) execRange(ctx context.Context, start, end time.Time) ([]
 			}
 			result = append(result, ar.alertToTimeSeries(a, s.Timestamps[i])...)
 
-			// save alert's state on last iteration, so it can be used on the next execRange call
-			if at.Equal(end) {
+			// if for>0, save alert's state on last iteration, so it can be used on the next execRange call
+			if ar.For > 0 && at.Equal(end) {
 				holdAlertState[alertID] = a
 			}
 		}
 	}
-	ar.alerts = holdAlertState
+	if len(holdAlertState) > 0 {
+		ar.alerts = holdAlertState
+	}
 	return result, nil
 }
 
@@ -392,7 +438,7 @@ const resolvedRetention = 15 * time.Minute
 
 // exec executes AlertingRule expression via the given Querier.
 // Based on the Querier results AlertingRule maintains notifier.Alerts
-func (ar *AlertingRule) exec(ctx context.Context, ts time.Time, limit int) ([]prompbmarshal.TimeSeries, error) {
+func (ar *AlertingRule) exec(ctx context.Context, ts time.Time, limit int) ([]prompb.TimeSeries, error) {
 	start := time.Now()
 	res, req, err := ar.q.Query(ctx, ar.Expr, ts)
 	curState := StateEntry{
@@ -428,10 +474,25 @@ func (ar *AlertingRule) exec(ctx context.Context, ts time.Time, limit int) ([]pr
 	expandedLabels := make([]*labelSet, len(res.Data))
 	expandedAnnotations := make([]map[string]string, len(res.Data))
 	for i, m := range res.Data {
-		ls, as, err := ar.expandTemplates(m, qFn, ts)
+		ls, err := ar.expandLabelTemplates(m, qFn)
 		if err != nil {
-			curState.Err = fmt.Errorf("failed to expand templates: %w", err)
-			return nil, curState.Err
+			// only set error in current state, but do not break alert processing
+			curState.Err = err
+			logger.Errorf("got templating error in rule %s: %q", ar.Name, err)
+		}
+		at := ts
+		alertID := hash(ls.processed)
+		if a, ok := ar.alerts[alertID]; ok {
+			// modify activeAt for annotation templating if the alert has already triggered(in state Pending or Firing)
+			if a.State != notifier.StateInactive {
+				at = a.ActiveAt
+			}
+		}
+		as, err := ar.expandAnnotationTemplates(m, qFn, at, ls)
+		if err != nil {
+			// only set error in current state, but do not break alert processing
+			curState.Err = err
+			logger.Errorf("got templating error in rule %s: %q", ar.Name, err)
 		}
 		expandedLabels[i] = ls
 		expandedAnnotations[i] = as
@@ -473,6 +534,7 @@ func (ar *AlertingRule) exec(ctx context.Context, ts time.Time, limit int) ([]pr
 			a.KeepFiringSince = time.Time{}
 			continue
 		}
+
 		a := ar.newAlert(m, ts, labels.processed, annotations)
 		a.ID = alertID
 		a.State = notifier.StatePending
@@ -480,7 +542,7 @@ func (ar *AlertingRule) exec(ctx context.Context, ts time.Time, limit int) ([]pr
 		ar.logDebugf(ts, a, "created in state PENDING")
 	}
 	var numActivePending int
-	var tss []prompbmarshal.TimeSeries
+	var tss []prompb.TimeSeries
 	for h, a := range ar.alerts {
 		// if alert wasn't updated in this iteration
 		// means it is resolved already
@@ -536,12 +598,15 @@ func (ar *AlertingRule) exec(ctx context.Context, ts time.Time, limit int) ([]pr
 	return append(tss, ar.toTimeSeries(ts.Unix())...), nil
 }
 
-func (ar *AlertingRule) expandTemplates(m datasource.Metric, qFn templates.QueryFn, ts time.Time) (*labelSet, map[string]string, error) {
+func (ar *AlertingRule) expandLabelTemplates(m datasource.Metric, qFn templates.QueryFn) (*labelSet, error) {
 	ls, err := ar.toLabels(m, qFn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to expand labels: %w", err)
+		return ls, fmt.Errorf("failed to expand label templates: %s", err)
 	}
+	return ls, nil
+}
 
+func (ar *AlertingRule) expandAnnotationTemplates(m datasource.Metric, qFn templates.QueryFn, activeAt time.Time, ls *labelSet) (map[string]string, error) {
 	tplData := notifier.AlertTplData{
 		Value:    m.Values[0],
 		Type:     ar.Type.String(),
@@ -549,19 +614,19 @@ func (ar *AlertingRule) expandTemplates(m datasource.Metric, qFn templates.Query
 		Expr:     ar.Expr,
 		AlertID:  hash(ls.processed),
 		GroupID:  ar.GroupID,
-		ActiveAt: ts,
+		ActiveAt: activeAt,
 		For:      ar.For,
 	}
 	as, err := notifier.ExecTemplate(qFn, ar.Annotations, tplData)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to template annotations: %w", err)
+		return as, fmt.Errorf("failed to expand annotation templates: %s", err)
 	}
-	return ls, as, nil
+	return as, nil
 }
 
 // toTimeSeries creates `ALERTS` and `ALERTS_FOR_STATE` for active alerts
-func (ar *AlertingRule) toTimeSeries(timestamp int64) []prompbmarshal.TimeSeries {
-	var tss []prompbmarshal.TimeSeries
+func (ar *AlertingRule) toTimeSeries(timestamp int64) []prompb.TimeSeries {
+	var tss []prompb.TimeSeries
 	for _, a := range ar.alerts {
 		if a.State == notifier.StateInactive {
 			continue
@@ -632,67 +697,67 @@ const (
 )
 
 // alertToTimeSeries converts the given alert with the given timestamp to time series
-func (ar *AlertingRule) alertToTimeSeries(a *notifier.Alert, timestamp int64) []prompbmarshal.TimeSeries {
-	return []prompbmarshal.TimeSeries{
+func (ar *AlertingRule) alertToTimeSeries(a *notifier.Alert, timestamp int64) []prompb.TimeSeries {
+	return []prompb.TimeSeries{
 		alertToTimeSeries(a, timestamp),
 		alertForToTimeSeries(a, timestamp),
 	}
 }
 
-func alertToTimeSeries(a *notifier.Alert, timestamp int64) prompbmarshal.TimeSeries {
-	labels := make([]prompbmarshal.Label, 0, len(a.Labels)+2)
+func alertToTimeSeries(a *notifier.Alert, timestamp int64) prompb.TimeSeries {
+	labels := make([]prompb.Label, 0, len(a.Labels)+2)
 	for k, v := range a.Labels {
-		labels = append(labels, prompbmarshal.Label{
+		labels = append(labels, prompb.Label{
 			Name:  k,
 			Value: v,
 		})
 	}
 	// __name__ already been dropped, no need to check duplication
-	labels = append(labels, prompbmarshal.Label{Name: "__name__", Value: alertMetricName})
+	labels = append(labels, prompb.Label{Name: "__name__", Value: alertMetricName})
 	if ol := promrelabel.GetLabelByName(labels, alertStateLabel); ol != nil {
 		ol.Value = a.State.String()
 	} else {
-		labels = append(labels, prompbmarshal.Label{Name: alertStateLabel, Value: a.State.String()})
+		labels = append(labels, prompb.Label{Name: alertStateLabel, Value: a.State.String()})
 	}
 	return newTimeSeries([]float64{1}, []int64{timestamp}, labels)
 }
 
 // alertForToTimeSeries returns a time series that represents
 // state of active alerts, where value is time when alert become active
-func alertForToTimeSeries(a *notifier.Alert, timestamp int64) prompbmarshal.TimeSeries {
-	labels := make([]prompbmarshal.Label, 0, len(a.Labels)+1)
+func alertForToTimeSeries(a *notifier.Alert, timestamp int64) prompb.TimeSeries {
+	labels := make([]prompb.Label, 0, len(a.Labels)+1)
 	for k, v := range a.Labels {
-		labels = append(labels, prompbmarshal.Label{
+		labels = append(labels, prompb.Label{
 			Name:  k,
 			Value: v,
 		})
 	}
 	// __name__ already been dropped, no need to check duplication
-	labels = append(labels, prompbmarshal.Label{Name: "__name__", Value: alertForStateMetricName})
+	labels = append(labels, prompb.Label{Name: "__name__", Value: alertForStateMetricName})
 	return newTimeSeries([]float64{float64(a.ActiveAt.Unix())}, []int64{timestamp}, labels)
 }
 
 // pendingAlertStaleTimeSeries returns stale `ALERTS` and `ALERTS_FOR_STATE` time series
 // for alerts which changed their state from Pending to Inactive or Firing.
-func pendingAlertStaleTimeSeries(ls map[string]string, timestamp int64, includeAlertForState bool) []prompbmarshal.TimeSeries {
-	var result []prompbmarshal.TimeSeries
-	baseLabels := make([]prompbmarshal.Label, 0, len(ls)+1)
+func pendingAlertStaleTimeSeries(ls map[string]string, timestamp int64, includeAlertForState bool) []prompb.TimeSeries {
+	var result []prompb.TimeSeries
+	baseLabels := make([]prompb.Label, 0, len(ls)+1)
 	for k, v := range ls {
-		baseLabels = append(baseLabels, prompbmarshal.Label{
+		baseLabels = append(baseLabels, prompb.Label{
 			Name:  k,
 			Value: v,
 		})
 	}
 
-	alertsLabels := make([]prompbmarshal.Label, 0, len(ls)+2)
+	alertsLabels := make([]prompb.Label, 0, len(ls)+2)
 	alertsLabels = append(alertsLabels, baseLabels...)
 	// __name__ already been dropped, no need to check duplication
-	alertsLabels = append(alertsLabels, prompbmarshal.Label{Name: "__name__", Value: alertMetricName})
-	alertsLabels = append(alertsLabels, prompbmarshal.Label{Name: alertStateLabel, Value: notifier.StatePending.String()})
+	alertsLabels = append(alertsLabels, prompb.Label{Name: "__name__", Value: alertMetricName})
+	alertsLabels = append(alertsLabels, prompb.Label{Name: alertStateLabel, Value: notifier.StatePending.String()})
 	result = append(result, newTimeSeries([]float64{decimal.StaleNaN}, []int64{timestamp}, alertsLabels))
 
 	if includeAlertForState {
-		baseLabels = append(baseLabels, prompbmarshal.Label{Name: "__name__", Value: alertForStateMetricName})
+		baseLabels = append(baseLabels, prompb.Label{Name: "__name__", Value: alertForStateMetricName})
 		result = append(result, newTimeSeries([]float64{decimal.StaleNaN}, []int64{timestamp}, baseLabels))
 	}
 	return result
@@ -700,24 +765,24 @@ func pendingAlertStaleTimeSeries(ls map[string]string, timestamp int64, includeA
 
 // firingAlertStaleTimeSeries returns stale `ALERTS` and `ALERTS_FOR_STATE` time series
 // for alerts which changed their state from Firing to Inactive.
-func firingAlertStaleTimeSeries(ls map[string]string, timestamp int64) []prompbmarshal.TimeSeries {
-	baseLabels := make([]prompbmarshal.Label, 0, len(ls)+1)
+func firingAlertStaleTimeSeries(ls map[string]string, timestamp int64) []prompb.TimeSeries {
+	baseLabels := make([]prompb.Label, 0, len(ls)+1)
 	for k, v := range ls {
-		baseLabels = append(baseLabels, prompbmarshal.Label{
+		baseLabels = append(baseLabels, prompb.Label{
 			Name:  k,
 			Value: v,
 		})
 	}
 
-	alertsLabels := make([]prompbmarshal.Label, 0, len(ls)+2)
+	alertsLabels := make([]prompb.Label, 0, len(ls)+2)
 	alertsLabels = append(alertsLabels, baseLabels...)
 	// __name__ already been dropped, no need to check duplication
-	alertsLabels = append(alertsLabels, prompbmarshal.Label{Name: "__name__", Value: alertMetricName})
-	alertsLabels = append(alertsLabels, prompbmarshal.Label{Name: alertStateLabel, Value: notifier.StateFiring.String()})
+	alertsLabels = append(alertsLabels, prompb.Label{Name: "__name__", Value: alertMetricName})
+	alertsLabels = append(alertsLabels, prompb.Label{Name: alertStateLabel, Value: notifier.StateFiring.String()})
 
-	baseLabels = append(baseLabels, prompbmarshal.Label{Name: "__name__", Value: alertForStateMetricName})
+	baseLabels = append(baseLabels, prompb.Label{Name: "__name__", Value: alertForStateMetricName})
 
-	return []prompbmarshal.TimeSeries{
+	return []prompb.TimeSeries{
 		newTimeSeries([]float64{decimal.StaleNaN}, []int64{timestamp}, alertsLabels),
 		newTimeSeries([]float64{decimal.StaleNaN}, []int64{timestamp}, baseLabels),
 	}

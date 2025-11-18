@@ -25,15 +25,18 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/snapshot/snapshotutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage/metricnamestats"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage/metricsmetadata"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache"
 	"github.com/VictoriaMetrics/fastcache"
+	"github.com/cespare/xxhash/v2"
 )
 
 const (
 	retention31Days = 31 * 24 * time.Hour
 	retentionMax    = 100 * 12 * retention31Days
+	idbPrefilStart  = time.Hour
 )
 
 // Storage represents TSDB storage.
@@ -50,7 +53,6 @@ type Storage struct {
 	newTimeseriesCreated   atomic.Uint64
 	slowRowInserts         atomic.Uint64
 	slowPerDayIndexInserts atomic.Uint64
-	slowMetricNameLoads    atomic.Uint64
 
 	hourlySeriesLimitRowsDropped atomic.Uint64
 	dailySeriesLimitRowsDropped  atomic.Uint64
@@ -68,6 +70,10 @@ type Storage struct {
 
 	// lock file for exclusive access to the storage on the given path.
 	flockF *os.File
+
+	// idbPrev contains the previously used indexdb.
+	// idbCurr becomes idbPrev after the indexDB rotation.
+	idbPrev atomic.Pointer[indexDB]
 
 	// idbCurr contains the currently used indexdb.
 	idbCurr atomic.Pointer[indexDB]
@@ -101,10 +107,6 @@ type Storage struct {
 	// metricNameCache is MetricID -> MetricName cache.
 	metricNameCache *workingsetcache.Cache
 
-	// dateMetricIDCache is (generation, Date, MetricID) cache, where generation is the indexdb generation.
-	// See generationTSID for details.
-	dateMetricIDCache *dateMetricIDCache
-
 	// Fast cache for MetricID values occurred during the current hour.
 	currHourMetricIDs atomic.Pointer[hourMetricIDs]
 
@@ -124,13 +126,6 @@ type Storage struct {
 	// Pending MetricIDs to be added to nextDayMetricIDs.
 	pendingNextDayMetricIDsLock sync.Mutex
 	pendingNextDayMetricIDs     *uint64set.Set
-
-	// prefetchedMetricIDs contains metricIDs for pre-fetched metricNames in the prefetchMetricNames function.
-	prefetchedMetricIDsLock sync.Mutex
-	prefetchedMetricIDs     *uint64set.Set
-
-	// prefetchedMetricIDsDeadline is used for periodic reset of prefetchedMetricIDs in order to limit its size under high rate of creating new series.
-	prefetchedMetricIDsDeadline atomic.Uint64
 
 	stopCh chan struct{}
 
@@ -158,7 +153,7 @@ type Storage struct {
 	// missingMetricIDs maps metricID to the deadline in unix timestamp seconds
 	// after which all the indexdb entries for the given metricID
 	// must be deleted if index entry isn't found by the given metricID.
-	// This is used inside searchMetricNameWithCache() and getTSIDsFromMetricIDs()
+	// This is used inside searchMetricNameWithCache() and SearchTSIDs()
 	// for detecting permanently missing metricID->metricName/TSID entries.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5959
 	missingMetricIDsLock          sync.Mutex
@@ -169,6 +164,18 @@ type Storage struct {
 	isReadOnly atomic.Bool
 
 	metricsTracker *metricnamestats.Tracker
+
+	// idbPrefillStartSeconds defines the start time of the idbNext prefill.
+	// It helps to spread load in time for index records creation and reduce resource usage.
+	idbPrefillStartSeconds int64
+
+	// logNewSeries is used for logging the new series. We will log new series when logNewSeries is true or logNewSeriesUntil is greater than the current time.
+	logNewSeries atomic.Bool
+
+	// logNewSeriesUntil is the timestamp until which new series will be logged. We will log new series when logNewSeries is true or logNewSeriesUntil is greater than the current time.
+	logNewSeriesUntil atomic.Uint64
+
+	metadataStorage *metricsmetadata.Storage
 }
 
 // OpenOptions optional args for MustOpenStorage
@@ -178,6 +185,8 @@ type OpenOptions struct {
 	MaxDailySeries        int
 	DisablePerDayIndex    bool
 	TrackMetricNamesStats bool
+	IDBPrefillStart       time.Duration
+	LogNewSeries          bool
 }
 
 // MustOpenStorage opens storage on the given path with the given retentionMsecs.
@@ -190,12 +199,19 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 	if retention <= 0 || retention > retentionMax {
 		retention = retentionMax
 	}
-	s := &Storage{
-		path:           path,
-		cachePath:      filepath.Join(path, cacheDirname),
-		retentionMsecs: retention.Milliseconds(),
-		stopCh:         make(chan struct{}),
+	idbPrefillStart := opts.IDBPrefillStart
+	if idbPrefillStart <= 0 {
+		idbPrefillStart = time.Hour
 	}
+	s := &Storage{
+		path:                   path,
+		cachePath:              filepath.Join(path, cacheDirname),
+		retentionMsecs:         retention.Milliseconds(),
+		stopCh:                 make(chan struct{}),
+		idbPrefillStartSeconds: idbPrefillStart.Milliseconds() / 1000,
+	}
+	s.logNewSeries.Store(opts.LogNewSeries)
+
 	fs.MustMkdirIfNotExist(path)
 
 	// Check whether the cache directory must be removed
@@ -203,10 +219,10 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1447 for details.
 	if fs.IsPathExist(filepath.Join(s.cachePath, resetCacheOnStartupFilename)) {
 		logger.Infof("removing cache directory at %q, since it contains `%s` file...", s.cachePath, resetCacheOnStartupFilename)
-		// Do not use fs.MustRemoveAll() here, since the cache directory may be mounted
-		// to a separate filesystem. In this case the fs.MustRemoveAll() will fail while
+		// Do not use fs.MustRemoveDir() here, since the cache directory may be mounted
+		// to a separate filesystem. In this case the fs.MustRemoveDir() will fail while
 		// trying to remove the mount root.
-		fs.RemoveDirContents(s.cachePath)
+		fs.MustRemoveDirContents(s.cachePath)
 		logger.Infof("cache directory at %q has been successfully removed", s.cachePath)
 	}
 
@@ -222,7 +238,6 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 	// Pre-create snapshots directory if it is missing.
 	snapshotsPath := filepath.Join(path, snapshotsDirname)
 	fs.MustMkdirIfNotExist(snapshotsPath)
-	fs.MustRemoveTemporaryDirs(snapshotsPath)
 
 	// Initialize series cardinality limiter.
 	if opts.MaxHourlySeries > 0 {
@@ -234,23 +249,21 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 
 	// Load caches.
 	mem := memory.Allowed()
-	s.tsidCache = s.mustLoadCache("metricName_tsid", getTSIDCacheSize())
-	s.metricIDCache = s.mustLoadCache("metricID_tsid", mem/16)
-	s.metricNameCache = s.mustLoadCache("metricID_metricName", getMetricNamesCacheSize())
-	s.dateMetricIDCache = newDateMetricIDCache()
+	s.tsidCache = s.mustLoadCache(tsidCacheFilename, getTSIDCacheSize())
+	s.metricIDCache = s.mustLoadCache(metricIDCacheFilename, mem/16)
+	s.metricNameCache = s.mustLoadCache(metricNameCacheFilename, getMetricNamesCacheSize())
 
 	hour := fasttime.UnixHour()
-	hmCurr := s.mustLoadHourMetricIDs(hour, "curr_hour_metric_ids")
-	hmPrev := s.mustLoadHourMetricIDs(hour-1, "prev_hour_metric_ids")
+	hmCurr := s.mustLoadHourMetricIDs(hour, currHourMetricIDsFilename)
+	hmPrev := s.mustLoadHourMetricIDs(hour-1, prevHourMetricIDsFilename)
 	s.currHourMetricIDs.Store(hmCurr)
 	s.prevHourMetricIDs.Store(hmPrev)
 	s.pendingHourEntries = &uint64set.Set{}
 
 	s.pendingNextDayMetricIDs = &uint64set.Set{}
 
-	s.prefetchedMetricIDs = &uint64set.Set{}
 	if opts.TrackMetricNamesStats {
-		mnt := metricnamestats.MustLoadFrom(filepath.Join(s.cachePath, "metric_usage_tracker"), uint64(getMetricNamesStatsCacheSize()))
+		mnt := metricnamestats.MustLoadFrom(filepath.Join(s.cachePath, metricNameTrackerFilename), uint64(getMetricNamesStatsCacheSize()))
 		s.metricsTracker = mnt
 		if mnt.IsEmpty() {
 			// metric names tracker performs attempt to track timeseries during ingestion only at tsid cache miss.
@@ -259,6 +272,8 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 			s.tsidCache.Reset()
 		}
 	}
+
+	s.metadataStorage = metricsmetadata.NewStorage(getMetadataStorageSize())
 
 	// Load metadata
 	metadataDir := filepath.Join(path, metadataDirname)
@@ -272,12 +287,9 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 	idbPath := filepath.Join(path, indexdbDirname)
 	idbSnapshotsPath := filepath.Join(idbPath, snapshotsDirname)
 	fs.MustMkdirIfNotExist(idbSnapshotsPath)
-	fs.MustRemoveTemporaryDirs(idbSnapshotsPath)
 	idbNext, idbCurr, idbPrev := s.mustOpenIndexDBTables(idbPath)
 
-	idbCurr.SetExtDB(idbPrev)
-	idbNext.SetExtDB(idbCurr)
-
+	s.idbPrev.Store(idbPrev)
 	s.idbCurr.Store(idbCurr)
 	s.idbNext.Store(idbNext)
 
@@ -362,6 +374,20 @@ func getMetricNamesCacheSize() int {
 	return maxMetricNameCacheSize
 }
 
+var maxMetadataStorageSize int
+
+// SetMetadataStorageSize overrides the default size of the metadata store
+func SetMetadataStorageSize(size int) {
+	maxMetadataStorageSize = size
+}
+
+func getMetadataStorageSize() int {
+	if maxMetadataStorageSize <= 0 {
+		return memory.Allowed() / 100
+	}
+	return maxMetadataStorageSize
+}
+
 func (s *Storage) getDeletedMetricIDs() *uint64set.Set {
 	return s.deletedMetricIDs.Load()
 }
@@ -390,13 +416,11 @@ func (s *Storage) updateDeletedMetricIDs(metricIDs *uint64set.Set) {
 func (s *Storage) DebugFlush() {
 	s.tb.DebugFlush()
 
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
+	idbPrev, idbCurr := s.getPrevAndCurrIndexDBs()
+	defer s.putPrevAndCurrIndexDBs(idbPrev, idbCurr)
 
-	idb.tb.DebugFlush()
-	idb.doExtDB(func(extDB *indexDB) {
-		extDB.tb.DebugFlush()
-	})
+	idbCurr.tb.DebugFlush()
+	idbPrev.tb.DebugFlush()
 
 	hour := fasttime.UnixHour()
 	s.updateCurrHourMetricIDs(hour)
@@ -435,20 +459,18 @@ func (s *Storage) MustCreateSnapshot() string {
 	dstMetadataDir := filepath.Join(dstDir, metadataDirname)
 	fs.MustCopyDirectory(srcMetadataDir, dstMetadataDir)
 
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
+	idbPrev, idbCurr := s.getPrevAndCurrIndexDBs()
+	defer s.putPrevAndCurrIndexDBs(idbPrev, idbCurr)
 
 	idbSnapshot := filepath.Join(srcDir, indexdbDirname, snapshotsDirname, snapshotName)
-	currSnapshot := filepath.Join(idbSnapshot, idb.name)
-	idb.tb.MustCreateSnapshotAt(currSnapshot)
-	idb.doExtDB(func(extDB *indexDB) {
-		prevSnapshot := filepath.Join(idbSnapshot, extDB.name)
-		extDB.tb.MustCreateSnapshotAt(prevSnapshot)
-	})
+	currSnapshot := filepath.Join(idbSnapshot, idbCurr.name)
+	idbCurr.tb.MustCreateSnapshotAt(currSnapshot)
+	prevSnapshot := filepath.Join(idbSnapshot, idbPrev.name)
+	idbPrev.tb.MustCreateSnapshotAt(prevSnapshot)
 	dstIdbDir := filepath.Join(dstDir, indexdbDirname)
 	fs.MustSymlinkRelative(idbSnapshot, dstIdbDir)
 
-	fs.MustSyncPath(dstDir)
+	fs.MustSyncPathAndParentDir(dstDir)
 
 	logger.Infof("created Storage snapshot for %q at %q in %.3f seconds", srcDir, dstDir, time.Since(startTime).Seconds())
 	return snapshotName
@@ -498,8 +520,8 @@ func (s *Storage) DeleteSnapshot(snapshotName string) error {
 
 	s.tb.MustDeleteSnapshot(snapshotName)
 	idbPath := filepath.Join(s.path, indexdbDirname, snapshotsDirname, snapshotName)
-	fs.MustRemoveDirAtomic(idbPath)
-	fs.MustRemoveDirAtomic(snapshotPath)
+	fs.MustRemoveDir(idbPath)
+	fs.MustRemoveDir(snapshotPath)
 
 	logger.Infof("deleted snapshot %q in %.3f seconds", snapshotPath, time.Since(startTime).Seconds())
 
@@ -532,33 +554,44 @@ func (s *Storage) MustDeleteStaleSnapshots(maxAge time.Duration) {
 	}
 }
 
-// getCurrAndNextIndexDBs increments refcount for the current and next indexDBs
-// and returns them along with a cleanup function that decrements their refcounts.
-// Returned indexDBs shouldn't be used after cleanup function was called.
-func (s *Storage) getCurrAndNextIndexDBs() (*indexDB, *indexDB, func()) {
+// getPrevAndCurrIndexDBs increments the refcount for prev and curr indexDBs and
+// returns them.
+func (s *Storage) getPrevAndCurrIndexDBs() (prev, curr *indexDB) {
 	s.idbLock.Lock()
 	defer s.idbLock.Unlock()
-	idbCurr := s.idbCurr.Load()
-	idbCurr.incRef()
-	idbNext := s.idbNext.Load()
-	idbNext.incRef()
-	return idbCurr, idbNext, func() {
-		idbCurr.decRef()
-		idbNext.decRef()
-	}
+	curr = s.idbCurr.Load()
+	prev = s.idbPrev.Load()
+	curr.incRef()
+	prev.incRef()
+	return prev, curr
 }
 
-// getCurrIndexDBs increments refcount for the current indexDB and returns it along with
-// a cleanup function that decrements its refcount.
-// Returned indexDB shouldn't be used after cleanup function was called.
-func (s *Storage) getCurrIndexDB() (*indexDB, func()) {
+// getIndexDBs increments the refcount for all indexDBs (prev, curr,
+// and next) and returns them.
+func (s *Storage) getIndexDBs() (prev, curr, next *indexDB) {
 	s.idbLock.Lock()
 	defer s.idbLock.Unlock()
-	idbCurr := s.idbCurr.Load()
-	idbCurr.incRef()
-	return idbCurr, func() {
-		idbCurr.decRef()
-	}
+	prev = s.idbPrev.Load()
+	curr = s.idbCurr.Load()
+	next = s.idbNext.Load()
+	next.incRef()
+	curr.incRef()
+	prev.incRef()
+	return prev, curr, next
+}
+
+// putPrevAndCurrIndexDBs decrements the refcount of prev and curr indexDBs.
+func (s *Storage) putPrevAndCurrIndexDBs(prev, curr *indexDB) {
+	prev.decRef()
+	curr.decRef()
+}
+
+// putPrevAndCurrIndexDBs decrements the refcount of all indexDBs (prev, curr,
+// and next).
+func (s *Storage) putIndexDBs(prev, curr, next *indexDB) {
+	prev.decRef()
+	curr.decRef()
+	next.decRef()
 }
 
 // Metrics contains essential metrics for the Storage.
@@ -577,7 +610,6 @@ type Metrics struct {
 	NewTimeseriesCreated   uint64
 	SlowRowInserts         uint64
 	SlowPerDayIndexInserts uint64
-	SlowMetricNameLoads    uint64
 
 	HourlySeriesLimitRowsDropped   uint64
 	HourlySeriesLimitMaxSeries     uint64
@@ -590,40 +622,26 @@ type Metrics struct {
 	TimestampsBlocksMerged uint64
 	TimestampsBytesSaved   uint64
 
-	TSIDCacheSize                uint64
-	TSIDCacheSizeBytes           uint64
-	TSIDCacheSizeMaxBytes        uint64
-	TSIDCacheRequests            uint64
-	TSIDCacheMisses              uint64
-	TSIDCacheCollisions          uint64
-	TSIDCacheSizeEvictionBytes   uint64
-	TSIDCacheExpireEvictionBytes uint64
-	TSIDCacheMissEvictionBytes   uint64
+	TSIDCacheSize         uint64
+	TSIDCacheSizeBytes    uint64
+	TSIDCacheSizeMaxBytes uint64
+	TSIDCacheRequests     uint64
+	TSIDCacheMisses       uint64
+	TSIDCacheCollisions   uint64
 
-	MetricIDCacheSize                uint64
-	MetricIDCacheSizeBytes           uint64
-	MetricIDCacheSizeMaxBytes        uint64
-	MetricIDCacheRequests            uint64
-	MetricIDCacheMisses              uint64
-	MetricIDCacheCollisions          uint64
-	MetricIDCacheSizeEvictionBytes   uint64
-	MetricIDCacheExpireEvictionBytes uint64
-	MetricIDCacheMissEvictionBytes   uint64
+	MetricIDCacheSize         uint64
+	MetricIDCacheSizeBytes    uint64
+	MetricIDCacheSizeMaxBytes uint64
+	MetricIDCacheRequests     uint64
+	MetricIDCacheMisses       uint64
+	MetricIDCacheCollisions   uint64
 
-	MetricNameCacheSize                uint64
-	MetricNameCacheSizeBytes           uint64
-	MetricNameCacheSizeMaxBytes        uint64
-	MetricNameCacheRequests            uint64
-	MetricNameCacheMisses              uint64
-	MetricNameCacheCollisions          uint64
-	MetricNameCacheSizeEvictionBytes   uint64
-	MetricNameCacheExpireEvictionBytes uint64
-	MetricNameCacheMissEvictionBytes   uint64
-
-	DateMetricIDCacheSize        uint64
-	DateMetricIDCacheSizeBytes   uint64
-	DateMetricIDCacheSyncsCount  uint64
-	DateMetricIDCacheResetsCount uint64
+	MetricNameCacheSize         uint64
+	MetricNameCacheSizeBytes    uint64
+	MetricNameCacheSizeMaxBytes uint64
+	MetricNameCacheRequests     uint64
+	MetricNameCacheMisses       uint64
+	MetricNameCacheCollisions   uint64
 
 	HourMetricIDCacheSize      uint64
 	HourMetricIDCacheSizeBytes uint64
@@ -631,17 +649,20 @@ type Metrics struct {
 	NextDayMetricIDCacheSize      uint64
 	NextDayMetricIDCacheSizeBytes uint64
 
-	PrefetchedMetricIDsSize      uint64
-	PrefetchedMetricIDsSizeBytes uint64
-
 	NextRetentionSeconds uint64
 
 	MetricNamesUsageTrackerSize         uint64
 	MetricNamesUsageTrackerSizeBytes    uint64
 	MetricNamesUsageTrackerSizeMaxBytes uint64
 
+	DeletedMetricsCount uint64
+
 	IndexDBMetrics IndexDBMetrics
 	TableMetrics   TableMetrics
+
+	MetadataStorageItemsCurrent     uint64
+	MetadataStorageCurrentSizeBytes uint64
+	MetadataStorageMaxSizeBytes     uint64
 }
 
 // Reset resets m.
@@ -665,7 +686,6 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	m.NewTimeseriesCreated += s.newTimeseriesCreated.Load()
 	m.SlowRowInserts += s.slowRowInserts.Load()
 	m.SlowPerDayIndexInserts += s.slowPerDayIndexInserts.Load()
-	m.SlowMetricNameLoads += s.slowMetricNameLoads.Load()
 
 	if sl := s.hourlySeriesLimiter; sl != nil {
 		m.HourlySeriesLimitRowsDropped += s.hourlySeriesLimitRowsDropped.Load()
@@ -690,9 +710,6 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	m.TSIDCacheRequests += cs.GetCalls
 	m.TSIDCacheMisses += cs.Misses
 	m.TSIDCacheCollisions += cs.Collisions
-	m.TSIDCacheExpireEvictionBytes += s.tsidCache.ExpireEvictionBytes.Load()
-	m.TSIDCacheMissEvictionBytes += s.tsidCache.MissEvictionBytes.Load()
-	m.TSIDCacheSizeEvictionBytes += s.tsidCache.SizeEvictionBytes.Load()
 
 	cs.Reset()
 	s.metricIDCache.UpdateStats(&cs)
@@ -702,9 +719,6 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	m.MetricIDCacheRequests += cs.GetCalls
 	m.MetricIDCacheMisses += cs.Misses
 	m.MetricIDCacheCollisions += cs.Collisions
-	m.MetricIDCacheExpireEvictionBytes += s.metricIDCache.ExpireEvictionBytes.Load()
-	m.MetricIDCacheMissEvictionBytes += s.metricIDCache.MissEvictionBytes.Load()
-	m.MetricIDCacheSizeEvictionBytes += s.metricIDCache.SizeEvictionBytes.Load()
 
 	cs.Reset()
 	s.metricNameCache.UpdateStats(&cs)
@@ -714,14 +728,6 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	m.MetricNameCacheRequests += cs.GetCalls
 	m.MetricNameCacheMisses += cs.Misses
 	m.MetricNameCacheCollisions += cs.Collisions
-	m.MetricNameCacheExpireEvictionBytes += s.metricNameCache.ExpireEvictionBytes.Load()
-	m.MetricNameCacheMissEvictionBytes += s.metricNameCache.MissEvictionBytes.Load()
-	m.MetricNameCacheSizeEvictionBytes += s.metricNameCache.SizeEvictionBytes.Load()
-
-	m.DateMetricIDCacheSize += uint64(s.dateMetricIDCache.EntriesCount())
-	m.DateMetricIDCacheSizeBytes += uint64(s.dateMetricIDCache.SizeBytes())
-	m.DateMetricIDCacheSyncsCount += s.dateMetricIDCache.syncsCount.Load()
-	m.DateMetricIDCacheResetsCount += s.dateMetricIDCache.resetsCount.Load()
 
 	hmCurr := s.currHourMetricIDs.Load()
 	hmPrev := s.prevHourMetricIDs.Load()
@@ -737,17 +743,17 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	m.NextDayMetricIDCacheSize += uint64(nextDayMetricIDs.Len())
 	m.NextDayMetricIDCacheSizeBytes += nextDayMetricIDs.SizeBytes()
 
-	s.prefetchedMetricIDsLock.Lock()
-	prefetchedMetricIDs := s.prefetchedMetricIDs
-	m.PrefetchedMetricIDsSize += uint64(prefetchedMetricIDs.Len())
-	m.PrefetchedMetricIDsSizeBytes += uint64(prefetchedMetricIDs.SizeBytes())
-	s.prefetchedMetricIDsLock.Unlock()
-
 	var tm metricnamestats.TrackerMetrics
 	s.metricsTracker.UpdateMetrics(&tm)
 	m.MetricNamesUsageTrackerSizeBytes = tm.CurrentSizeBytes
 	m.MetricNamesUsageTrackerSize = tm.CurrentItemsCount
 	m.MetricNamesUsageTrackerSizeMaxBytes = tm.MaxSizeBytes
+
+	var mr metricsmetadata.MetadataStorageMetrics
+	s.metadataStorage.UpdateMetrics(&mr)
+	m.MetadataStorageItemsCurrent = uint64(mr.ItemsCurrent)
+	m.MetadataStorageCurrentSizeBytes = mr.CurrentSizeBytes
+	m.MetadataStorageMaxSizeBytes = mr.MaxSizeBytes
 
 	d := s.nextRetentionSeconds()
 	if d < 0 {
@@ -755,9 +761,12 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	}
 	m.NextRetentionSeconds = uint64(d)
 
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
-	idb.UpdateMetrics(&m.IndexDBMetrics)
+	m.DeletedMetricsCount += uint64(s.getDeletedMetricIDs().Len())
+
+	idbPrev, idbCurr := s.getPrevAndCurrIndexDBs()
+	defer s.putPrevAndCurrIndexDBs(idbPrev, idbCurr)
+	idbCurr.UpdateMetrics(&m.IndexDBMetrics)
+	idbPrev.UpdateMetrics(&m.IndexDBMetrics)
 	s.tb.UpdateMetrics(&m.TableMetrics)
 }
 
@@ -823,13 +832,11 @@ func (s *Storage) startFreeDiskSpaceWatcher() {
 func (s *Storage) notifyReadWriteMode() {
 	s.tb.NotifyReadWriteMode()
 
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
+	idbPrev, idbCurr := s.getPrevAndCurrIndexDBs()
+	defer s.putPrevAndCurrIndexDBs(idbPrev, idbCurr)
 
-	idb.tb.NotifyReadWriteMode()
-	idb.doExtDB(func(extDB *indexDB) {
-		extDB.tb.NotifyReadWriteMode()
-	})
+	idbCurr.tb.NotifyReadWriteMode()
+	idbPrev.tb.NotifyReadWriteMode()
 }
 
 func (s *Storage) startRetentionWatcher() {
@@ -906,7 +913,7 @@ func (s *Storage) mustRotateIndexDB(currentTime time.Time) {
 	// Create new indexdb table, which will be used as idbNext
 	newTableName := nextIndexDBTableName()
 	idbNewPath := filepath.Join(s.path, indexdbDirname, newTableName)
-	idbNew := mustOpenIndexDB(idbNewPath, s, &s.isReadOnly)
+	idbNew := mustOpenIndexDB(idbNewPath, s, &s.isReadOnly, false)
 
 	// Update nextRotationTimestamp
 	nextRotationTimestamp := currentTime.Unix() + s.retentionMsecs/1000
@@ -916,18 +923,18 @@ func (s *Storage) mustRotateIndexDB(currentTime time.Time) {
 
 	// Set idbNext to idbNew
 	idbNext := s.idbNext.Load()
-	idbNew.SetExtDB(idbNext)
 	s.idbNext.Store(idbNew)
 
 	// Set idbCurr to idbNext
 	idbCurr := s.idbCurr.Load()
 	s.idbCurr.Store(idbNext)
 
+	idbPrev := s.idbPrev.Load()
+	s.idbPrev.Store(idbCurr)
+	idbCurr.noRegisterNewSeries.Store(true)
 	// Schedule data removal for idbPrev
-	idbCurr.doExtDB(func(extDB *indexDB) {
-		extDB.scheduleToDrop()
-	})
-	idbCurr.SetExtDB(nil)
+	idbPrev.scheduleToDrop()
+	idbPrev.decRef()
 
 	s.idbLock.Unlock()
 
@@ -960,8 +967,6 @@ func (s *Storage) mustRotateIndexDB(currentTime time.Time) {
 	s.currHourMetricIDs.Store(&hourMetricIDs{})
 	s.prevHourMetricIDs.Store(&hourMetricIDs{})
 
-	// Do not flush dateMetricIDCache, since it contains entries prefixed with idb generation.
-
 	// There is no need in resetting nextDayMetricIDs, since it contains entries prefixed with idb generation.
 
 	// Do not flush metricIDCache and metricNameCache, since all the metricIDs
@@ -973,7 +978,7 @@ func (s *Storage) resetAndSaveTSIDCache() {
 	// from inconsistent behaviour after possible unclean shutdown.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1347
 	s.tsidCache.Reset()
-	s.mustSaveCache(s.tsidCache, "metricName_tsid")
+	s.mustSaveCache(s.tsidCache, tsidCacheFilename)
 }
 
 // MustClose closes the storage.
@@ -989,26 +994,30 @@ func (s *Storage) MustClose() {
 
 	s.tb.MustClose()
 
-	// Closing idbNext will also close idbCurr and idbPrev.
 	s.idbNext.Load().MustClose()
+	s.idbCurr.Load().MustClose()
+	s.idbPrev.Load().MustClose()
 
 	// Save caches.
-	s.mustSaveCache(s.tsidCache, "metricName_tsid")
+	s.mustSaveCache(s.tsidCache, tsidCacheFilename)
 	s.tsidCache.Stop()
-	s.mustSaveCache(s.metricIDCache, "metricID_tsid")
+	s.mustSaveCache(s.metricIDCache, metricIDCacheFilename)
 	s.metricIDCache.Stop()
-	s.mustSaveCache(s.metricNameCache, "metricID_metricName")
+	s.mustSaveCache(s.metricNameCache, metricNameCacheFilename)
 	s.metricNameCache.Stop()
 
 	hmCurr := s.currHourMetricIDs.Load()
-	s.mustSaveHourMetricIDs(hmCurr, "curr_hour_metric_ids")
+	s.mustSaveHourMetricIDs(hmCurr, currHourMetricIDsFilename)
 	hmPrev := s.prevHourMetricIDs.Load()
-	s.mustSaveHourMetricIDs(hmPrev, "prev_hour_metric_ids")
+	s.mustSaveHourMetricIDs(hmPrev, prevHourMetricIDsFilename)
 
 	nextDayMetricIDs := s.nextDayMetricIDs.Load()
 	s.mustSaveNextDayMetricIDs(nextDayMetricIDs)
 
 	s.metricsTracker.MustClose()
+
+	s.metadataStorage.MustClose()
+
 	// Release lock file.
 	fs.MustClose(s.flockF)
 	s.flockF = nil
@@ -1029,8 +1038,7 @@ func (s *Storage) mustLoadNextDayMetricIDs(generation, date uint64) *byDateMetri
 			date:       date,
 		},
 	}
-	name := "next_day_metric_ids_v2"
-	path := filepath.Join(s.cachePath, name)
+	path := filepath.Join(s.cachePath, nextDayMetricIDsFilename)
 	if !fs.IsPathExist(path) {
 		return e
 	}
@@ -1048,6 +1056,7 @@ func (s *Storage) mustLoadNextDayMetricIDs(generation, date uint64) *byDateMetri
 	src = src[8:]
 	if generationLoaded != generation {
 		logger.Infof("discarding %s, since it contains data for stale generation; got %d; want %d", path, generationLoaded, generation)
+		return e
 	}
 	dateLoaded := encoding.UnmarshalUint64(src)
 	src = src[8:]
@@ -1110,8 +1119,7 @@ func (s *Storage) mustLoadHourMetricIDs(hour uint64, name string) *hourMetricIDs
 }
 
 func (s *Storage) mustSaveNextDayMetricIDs(e *byDateMetricIDEntry) {
-	name := "next_day_metric_ids_v2"
-	path := filepath.Join(s.cachePath, name)
+	path := filepath.Join(s.cachePath, nextDayMetricIDsFilename)
 	dst := make([]byte, 0, e.v.Len()*8+16)
 
 	// Marshal header
@@ -1121,9 +1129,7 @@ func (s *Storage) mustSaveNextDayMetricIDs(e *byDateMetricIDEntry) {
 	// Marshal e.v
 	dst = marshalUint64Set(dst, &e.v)
 
-	if err := os.WriteFile(path, dst, 0644); err != nil {
-		logger.Panicf("FATAL: cannot write %d bytes to %q: %s", len(dst), path, err)
-	}
+	fs.MustWriteSync(path, dst)
 }
 
 func (s *Storage) mustSaveHourMetricIDs(hm *hourMetricIDs, name string) {
@@ -1136,9 +1142,7 @@ func (s *Storage) mustSaveHourMetricIDs(hm *hourMetricIDs, name string) {
 	// Marshal hm.m
 	dst = marshalUint64Set(dst, hm.m)
 
-	if err := os.WriteFile(path, dst, 0644); err != nil {
-		logger.Panicf("FATAL: cannot write %d bytes to %q: %s", len(dst), path, err)
-	}
+	fs.MustWriteSync(path, dst)
 }
 
 func unmarshalUint64Set(src []byte) (*uint64set.Set, []byte, error) {
@@ -1211,9 +1215,7 @@ func (s *Storage) mustSaveCache(c *workingsetcache.Cache, name string) {
 	defer saveCacheLock.Unlock()
 
 	path := filepath.Join(s.cachePath, name)
-	if err := c.Save(path); err != nil {
-		logger.Panicf("FATAL: cannot save cache to %q: %s", path, err)
-	}
+	c.MustSave(path)
 }
 
 // saveCacheLock prevents from data races when multiple concurrent goroutines save the same cache.
@@ -1249,6 +1251,150 @@ func nextRetentionDeadlineSeconds(atSecs, retentionSecs, offsetSecs int64) int64
 	return deadline
 }
 
+func (s *Storage) getMetricNameFromCache(dst []byte, metricID uint64) []byte {
+	// There is no need in checking for deleted metricIDs here, since they
+	// must be checked by the caller.
+	key := (*[unsafe.Sizeof(metricID)]byte)(unsafe.Pointer(&metricID))
+	return s.metricNameCache.Get(dst, key[:])
+}
+
+func (s *Storage) putMetricNameToCache(metricID uint64, metricName []byte) {
+	key := (*[unsafe.Sizeof(metricID)]byte)(unsafe.Pointer(&metricID))
+	s.metricNameCache.Set(key[:], metricName)
+}
+
+// searchAndMerge concurrently performs a search operation on all IndexDBs.
+// The individual search results are then merged (merge function applied
+// only if there is more than one index).
+//
+// The function creates a child query tracer for each search function call and
+// closes it once the search() returns. Thus, implementations of search func
+// must not close the query tracer that they receive.
+func searchAndMerge[T any](qt *querytracer.Tracer, s *Storage, tr TimeRange, search func(qt *querytracer.Tracer, idb *indexDB, tr TimeRange) (T, error), merge func([]T) T) (T, error) {
+	qt = qt.NewChild("search indexDBs: timeRange=%v", &tr)
+	defer qt.Done()
+
+	idbPrev, idbCurr := s.getPrevAndCurrIndexDBs()
+	defer s.putPrevAndCurrIndexDBs(idbPrev, idbCurr)
+	var idbs = []*indexDB{idbPrev, idbCurr}
+
+	qtSearch := qt.NewChild("search %d indexDBs in parallel", len(idbs))
+	var wg sync.WaitGroup
+	data := make([]T, len(idbs))
+	errs := make([]error, len(idbs))
+	for i, idb := range idbs {
+		searchTR := s.adjustTimeRange(tr)
+		qtChild := qtSearch.NewChild("search indexDB %s: timeRange=%v", idb.name, &searchTR)
+		wg.Add(1)
+		go func(qt *querytracer.Tracer, i int, idb *indexDB, tr TimeRange) {
+			defer wg.Done()
+			defer qt.Done()
+
+			data[i], errs[i] = search(qt, idb, tr)
+		}(qtChild, i, idb, searchTR)
+	}
+	wg.Wait()
+	qtSearch.Done()
+
+	for _, err := range errs {
+		if err != nil {
+			var zeroValue T
+			return zeroValue, err
+		}
+	}
+
+	qtMerge := qt.NewChild("merge search results")
+	result := merge(data)
+	qtMerge.Done()
+
+	return result, nil
+}
+
+// searchAndMergeUniq is a specific searchAndMerge operation that is common for
+// most index searches. It expects each individual search to return a set of
+// strings. The results of all individual searches are then unioned and the
+// resulting set is converted into a slice. If result contains more than maxResults
+// elements, it is truncated to maxResults.
+//
+// The final result is not sorted since it must be done by vmselect.
+func searchAndMergeUniq(qt *querytracer.Tracer, s *Storage, tr TimeRange, search func(qt *querytracer.Tracer, idb *indexDB, tr TimeRange) (map[string]struct{}, error), maxResults int) ([]string, error) {
+	merge := func(data []map[string]struct{}) map[string]struct{} {
+		if len(data) == 0 {
+			return nil
+		}
+
+		totalLen := 0
+		for _, d := range data {
+			totalLen += len(d)
+		}
+
+		if totalLen > maxResults {
+			totalLen = maxResults
+		}
+
+		all := make(map[string]struct{}, totalLen)
+		for _, d := range data {
+			for v := range d {
+				if len(all) >= maxResults {
+					return all
+				}
+				all[v] = struct{}{}
+			}
+		}
+		return all
+	}
+
+	m, err := searchAndMerge(qt, s, tr, search, merge)
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]string, 0, len(m))
+	for k := range m {
+		res = append(res, k)
+	}
+	return res, nil
+}
+
+// SearchTSIDs searches the TSIDs that correspond to filters within the given
+// time range.
+//
+// The returned TSIDs are sorted.
+//
+// The method will fail if the number of found TSIDs exceeds maxMetrics or the
+// search has not completed within the specified deadline.
+func (s *Storage) SearchTSIDs(qt *querytracer.Tracer, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) ([]TSID, error) {
+	qt = qt.NewChild("search TSIDs: filters=%s, timeRange=%s, maxMetrics=%d", tfss, &tr, maxMetrics)
+	defer qt.Done()
+
+	search := func(qt *querytracer.Tracer, idb *indexDB, tr TimeRange) ([]TSID, error) {
+		return idb.SearchTSIDs(qt, tfss, tr, maxMetrics, deadline)
+	}
+
+	merge := func(data [][]TSID) []TSID {
+		tsidss := make([][]TSID, 0, len(data))
+		for _, d := range data {
+			if len(d) > 0 {
+				tsidss = append(tsidss, d)
+			}
+		}
+		if len(tsidss) == 0 {
+			return nil
+		}
+		if len(tsidss) == 1 {
+			return tsidss[0]
+		}
+		return mergeSortedTSIDs(tsidss)
+	}
+
+	tsids, err := searchAndMerge(qt, s, tr, search, merge)
+	if err != nil {
+		return nil, err
+	}
+
+	return tsids, nil
+}
+
 // SearchMetricNames returns marshaled metric names matching the given tfss on
 // the given tr.
 //
@@ -1263,13 +1409,33 @@ func nextRetentionDeadlineSeconds(atSecs, retentionSecs, offsetSecs int64) int64
 // time range is ignored and the metrics are searched within the entire
 // retention period, i.e. the global index are used for searching.
 func (s *Storage) SearchMetricNames(qt *querytracer.Tracer, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) ([]string, error) {
-	tr = s.adjustTimeRange(tr)
-	qt = qt.NewChild("search for matching metric names: filters=%s, timeRange=%s", tfss, &tr)
-	defer qt.Done()
-
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
-	return idb.SearchMetricNames(qt, tfss, tr, maxMetrics, deadline)
+	qt = qt.NewChild("search metric names: filters=%s, timeRange=%s, maxMetrics: %d", tfss, &tr, maxMetrics)
+	search := func(qt *querytracer.Tracer, idb *indexDB, tr TimeRange) ([]string, error) {
+		return idb.SearchMetricNames(qt, tfss, tr, maxMetrics, deadline)
+	}
+	merge := func(data [][]string) []string {
+		var n int
+		for _, d := range data {
+			n += len(d)
+		}
+		seen := make(map[string]struct{}, n)
+		all := make([]string, 0, n)
+		for _, d := range data {
+			for _, v := range d {
+				if _, ok := seen[v]; !ok {
+					all = append(all, v)
+					seen[v] = struct{}{}
+				}
+			}
+		}
+		return all
+	}
+	res, err := searchAndMerge(qt, s, tr, search, merge)
+	if err != nil {
+		return nil, err
+	}
+	qt.Donef("found %d metric names", len(res))
+	return res, nil
 }
 
 // ErrDeadlineExceeded is returned when the request times out.
@@ -1281,19 +1447,47 @@ var ErrDeadlineExceeded = fmt.Errorf("deadline exceeded")
 // an error will be returned. Otherwise, the function returns the number of
 // metrics deleted.
 func (s *Storage) DeleteSeries(qt *querytracer.Tracer, tfss []*TagFilters, maxMetrics int) (int, error) {
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
+	qt = qt.NewChild("delete series: filters=%s, maxMetrics=%d", tfss, maxMetrics)
+	defer qt.Done()
 
-	deletedCount, err := idb.DeleteTSIDs(qt, tfss, maxMetrics)
-	if err != nil {
-		return deletedCount, fmt.Errorf("cannot delete tsids: %w", err)
+	if len(tfss) == 0 {
+		return 0, nil
 	}
-	// Do not reset MetricName->TSID cache, since it is already reset inside DeleteTSIDs.
+
+	// Not deleting in parallel because the deletion operation is rare.
+	deletedMetricIDs := &uint64set.Set{}
+
+	idbPrev, idbCurr := s.getPrevAndCurrIndexDBs()
+	defer s.putPrevAndCurrIndexDBs(idbPrev, idbCurr)
+
+	var (
+		dmisPrev *uint64set.Set
+		dmisCurr *uint64set.Set
+		err      error
+	)
+
+	qt.Printf("start deleting from previous indexDB")
+	dmisPrev, err = idbPrev.DeleteSeries(qt, tfss, maxMetrics)
+	if err != nil {
+		return 0, err
+	}
+	qt.Printf("deleted %d metricIDs from previous indexDB", dmisPrev.Len())
+	deletedMetricIDs.UnionMayOwn(dmisPrev)
+
+	qt.Printf("start deleting from current indexDB")
+	dmisCurr, err = idbCurr.DeleteSeries(qt, tfss, maxMetrics)
+	if err != nil {
+		return 0, err
+	}
+	qt.Printf("deleted %d metricIDs from current indexDB", dmisCurr.Len())
+	deletedMetricIDs.UnionMayOwn(dmisCurr)
 
 	// Do not reset MetricID->MetricName cache, since it must be used only
 	// after filtering out deleted metricIDs.
 
-	return deletedCount, nil
+	n := deletedMetricIDs.Len()
+	qt.Donef("deleted %d unique metricIDs", n)
+	return n, nil
 }
 
 // SearchLabelNames searches for label names matching the given tfss on tr.
@@ -1306,10 +1500,18 @@ func (s *Storage) DeleteSeries(qt *querytracer.Tracer, tfss []*TagFilters, maxMe
 // time range is ignored and the label names are searched within the entire
 // retention period, i.e. the global index are used for searching.
 func (s *Storage) SearchLabelNames(qt *querytracer.Tracer, tfss []*TagFilters, tr TimeRange, maxLabelNames, maxMetrics int, deadline uint64) ([]string, error) {
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
-	tr = s.adjustTimeRange(tr)
-	return idb.SearchLabelNames(qt, tfss, tr, maxLabelNames, maxMetrics, deadline)
+	qt = qt.NewChild("search for label names: filters=%s, timeRange=%s, maxLabelNames=%d, maxMetrics=%d", tfss, &tr, maxLabelNames, maxMetrics)
+	defer qt.Done()
+
+	search := func(qt *querytracer.Tracer, idb *indexDB, tr TimeRange) (map[string]struct{}, error) {
+		return idb.SearchLabelNames(qt, tfss, tr, maxLabelNames, maxMetrics, deadline)
+	}
+	res, err := searchAndMergeUniq(qt, s, tr, search, maxLabelNames)
+	if err != nil {
+		return nil, err
+	}
+	qt.Printf("found %d label names", len(res))
+	return res, nil
 }
 
 // SearchLabelValues searches for label values for the given labelName, filters
@@ -1323,11 +1525,18 @@ func (s *Storage) SearchLabelNames(qt *querytracer.Tracer, tfss []*TagFilters, t
 // time range is ignored and the label values are searched within the entire
 // retention period, i.e. the global index are used for searching.
 func (s *Storage) SearchLabelValues(qt *querytracer.Tracer, labelName string, tfss []*TagFilters, tr TimeRange, maxLabelValues, maxMetrics int, deadline uint64) ([]string, error) {
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
-	tr = s.adjustTimeRange(tr)
+	qt = qt.NewChild("search for label values: labelName=%q, filters=%s, timeRange=%s, maxLabelNames=%d, maxMetrics=%d", labelName, tfss, &tr, maxLabelValues, maxMetrics)
+	defer qt.Done()
 
-	return idb.SearchLabelValues(qt, labelName, tfss, tr, maxLabelValues, maxMetrics, deadline)
+	search := func(qt *querytracer.Tracer, idb *indexDB, tr TimeRange) (map[string]struct{}, error) {
+		return idb.SearchLabelValues(qt, labelName, tfss, tr, maxLabelValues, maxMetrics, deadline)
+	}
+	res, err := searchAndMergeUniq(qt, s, tr, search, maxLabelValues)
+	if err != nil {
+		return nil, err
+	}
+	qt.Printf("found %d label values", len(res))
+	return res, err
 }
 
 // SearchTagValueSuffixes returns all the tag value suffixes for the given
@@ -1347,13 +1556,16 @@ func (s *Storage) SearchLabelValues(qt *querytracer.Tracer, labelName string, tf
 // If -disablePerDayIndex is set or the time range is more than 40 days, the
 // time range is ignored and the tag value suffixes are searched within the
 // entire retention period, i.e. the global index are used for searching.
-func (s *Storage) SearchTagValueSuffixes(qt *querytracer.Tracer, tr TimeRange, tagKey, tagValuePrefix string,
-	delimiter byte, maxTagValueSuffixes int, deadline uint64,
-) ([]string, error) {
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
-	tr = s.adjustTimeRange(tr)
-	return idb.SearchTagValueSuffixes(qt, tr, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes, deadline)
+func (s *Storage) SearchTagValueSuffixes(qt *querytracer.Tracer, tr TimeRange, tagKey, tagValuePrefix string, delimiter byte, maxTagValueSuffixes int, deadline uint64) ([]string, error) {
+	search := func(qt *querytracer.Tracer, idb *indexDB, tr TimeRange) (map[string]struct{}, error) {
+		return idb.SearchTagValueSuffixes(qt, tr, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes, deadline)
+	}
+	res, err := searchAndMergeUniq(qt, s, tr, search, maxTagValueSuffixes)
+	if err != nil {
+		return nil, err
+	}
+	qt.Printf("found %d tag value suffixes", len(res))
+	return res, err
 }
 
 // SearchGraphitePaths returns all the matching paths for the given graphite
@@ -1367,11 +1579,17 @@ func (s *Storage) SearchTagValueSuffixes(qt *querytracer.Tracer, tr TimeRange, t
 // time range is ignored and the graphite paths are searched within the entire
 // retention period, i.e. global index are used for searching.
 func (s *Storage) SearchGraphitePaths(qt *querytracer.Tracer, tr TimeRange, query []byte, maxPaths int, deadline uint64) ([]string, error) {
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
-	tr = s.adjustTimeRange(tr)
 	query = replaceAlternateRegexpsWithGraphiteWildcards(query)
-	return idb.SearchGraphitePaths(qt, tr, nil, query, maxPaths, deadline)
+	search := func(qt *querytracer.Tracer, idb *indexDB, tr TimeRange) (map[string]struct{}, error) {
+		return idb.SearchGraphitePaths(qt, tr, nil, query, maxPaths, deadline)
+	}
+
+	res, err := searchAndMergeUniq(qt, s, tr, search, maxPaths)
+	if err != nil {
+		return nil, err
+	}
+	qt.Printf("found %d graphite paths", len(res))
+	return res, err
 }
 
 // replaceAlternateRegexpsWithGraphiteWildcards replaces (foo|..|bar) with {foo,...,bar} in b and returns the new value.
@@ -1419,11 +1637,23 @@ func replaceAlternateRegexpsWithGraphiteWildcards(b []byte) []byte {
 // GetSeriesCount returns the approximate number of unique time series.
 //
 // It includes the deleted series too and may count the same series
-// up to two times - in db and extDB.
+// up to two times - in curr and prev indexDBs.
 func (s *Storage) GetSeriesCount(deadline uint64) (uint64, error) {
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
-	return idb.GetSeriesCount(deadline)
+	tr := TimeRange{
+		MinTimestamp: 0,
+		MaxTimestamp: time.Now().UnixMilli(),
+	}
+	search := func(_ *querytracer.Tracer, idb *indexDB, _ TimeRange) (uint64, error) {
+		return idb.GetSeriesCount(deadline)
+	}
+	merge := func(data []uint64) uint64 {
+		var total uint64
+		for _, cnt := range data {
+			total += cnt
+		}
+		return total
+	}
+	return searchAndMerge(nil, s, tr, search, merge)
 }
 
 // GetTSDBStatus returns TSDB status data for /api/v1/status/tsdb
@@ -1434,15 +1664,31 @@ func (s *Storage) GetSeriesCount(deadline uint64) (uint64, error) {
 // Otherwise, the date is ignored and the status is calculated for the entire
 // retention period, i.e. the global index are used for calculation.
 func (s *Storage) GetTSDBStatus(qt *querytracer.Tracer, tfss []*TagFilters, date uint64, focusLabel string, topN, maxMetrics int, deadline uint64) (*TSDBStatus, error) {
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
+	qt = qt.NewChild("getting TSDB status")
+	defer qt.Done()
+
+	idbPrev, idbCurr := s.getPrevAndCurrIndexDBs()
+	defer s.putPrevAndCurrIndexDBs(idbPrev, idbCurr)
+
 	if s.disablePerDayIndex {
 		date = globalIndexDate
 	}
-	res, err := idb.GetTSDBStatus(qt, tfss, date, focusLabel, topN, maxMetrics, deadline)
+
+	qtChild := qt.NewChild("getting TSDB status in indexDB %q", idbCurr.name)
+	res, err := idbCurr.GetTSDBStatus(qtChild, tfss, date, focusLabel, topN, maxMetrics, deadline)
+	qtChild.Done()
 	if err != nil {
 		return nil, err
 	}
+	if !res.hasEntries() {
+		qtChild = qt.NewChild("getting TSDB status in indexDB %q", idbPrev.name)
+		res, err = idbPrev.GetTSDBStatus(qtChild, tfss, date, focusLabel, topN, maxMetrics, deadline)
+		qtChild.Done()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if s.metricsTracker != nil && len(res.SeriesCountByMetricName) > 0 {
 		// for performance reason always check if metricsTracker is configured
 		names := make([]string, len(res.SeriesCountByMetricName))
@@ -1627,21 +1873,23 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 	var newSeriesCount uint64
 	var seriesRepopulated uint64
 
-	idb, putIndexDB := s.getCurrIndexDB()
-	defer putIndexDB()
-	generation := idb.generation
-	is := idb.getIndexSearch(noDeadline)
-	defer idb.putIndexSearch(is)
+	idbPrev, idbCurr := s.getPrevAndCurrIndexDBs()
+	defer s.putPrevAndCurrIndexDBs(idbPrev, idbCurr)
+	generation := idbCurr.generation
+	isCurr := idbCurr.getIndexSearch(noDeadline)
+	defer idbCurr.putIndexSearch(isCurr)
+	isPrev := idbPrev.getIndexSearch(noDeadline)
+	defer idbPrev.putIndexSearch(isPrev)
 	var firstWarn error
 	for i := range mrs {
 		mr := &mrs[i]
+		if !s.registerSeriesCardinality(mr.MetricNameRaw) {
+			// Skip row, since it exceeds cardinality limit
+			continue
+		}
 		date := s.date(mr.Timestamp)
 		if s.getTSIDFromCache(&genTSID, mr.MetricNameRaw) {
 			// Fast path - mr.MetricNameRaw has been already registered in the current idb.
-			if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
-				// Skip row, since it exceeds cardinality limit
-				continue
-			}
 			if genTSID.generation < generation {
 				// The found TSID is from the previous indexdb. Create it in the current indexdb.
 
@@ -1650,29 +1898,27 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 					// This guarantees that invalid rows don't prevent
 					// from adding valid rows into the storage.
 					if firstWarn == nil {
-						firstWarn = fmt.Errorf("cannot umarshal MetricNameRaw %q: %w", mr.MetricNameRaw, err)
+						firstWarn = fmt.Errorf("cannot unmarshal MetricNameRaw %q: %w", mr.MetricNameRaw, err)
 					}
 					s.invalidRawMetricNames.Add(1)
 					continue
 				}
 				mn.sortTags()
 
-				createAllIndexesForMetricName(idb, mn, &genTSID.TSID, date)
+				createAllIndexesForMetricName(idbCurr, mn, &genTSID.TSID, date)
 				genTSID.generation = generation
-				s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
+				s.storeTSIDToCache(&genTSID, mr.MetricNameRaw)
 				seriesRepopulated++
-			} else if !s.dateMetricIDCache.Has(generation, date, genTSID.TSID.MetricID) {
-				if !is.hasDateMetricIDNoExtDB(date, genTSID.TSID.MetricID) {
-					if err := mn.UnmarshalRaw(mr.MetricNameRaw); err != nil {
-						if firstWarn == nil {
-							firstWarn = fmt.Errorf("cannot unmarshal MetricNameRaw %q: %w", mr.MetricNameRaw, err)
-						}
-						continue
+			} else if !isCurr.hasDateMetricID(date, genTSID.TSID.MetricID) {
+				if err := mn.UnmarshalRaw(mr.MetricNameRaw); err != nil {
+					if firstWarn == nil {
+						firstWarn = fmt.Errorf("cannot unmarshal MetricNameRaw %q: %w", mr.MetricNameRaw, err)
 					}
-					mn.sortTags()
-					idb.createPerDayIndexes(date, &genTSID.TSID, mn)
+					s.invalidRawMetricNames.Add(1)
+					continue
 				}
-				s.dateMetricIDCache.Set(generation, date, genTSID.TSID.MetricID)
+				mn.sortTags()
+				idbCurr.createPerDayIndexes(date, &genTSID.TSID, mn)
 			}
 			continue
 		}
@@ -1693,37 +1939,25 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 		mn.sortTags()
 		metricNameBuf = mn.Marshal(metricNameBuf[:0])
 
-		if is.getTSIDByMetricName(&genTSID, metricNameBuf, date) {
+		if isCurr.getTSIDByMetricName(&genTSID, metricNameBuf, date) || isPrev.getTSIDByMetricName(&genTSID, metricNameBuf, date) {
 			// Slower path - the TSID has been found in indexdb.
-
-			if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
-				// Skip the row, since it exceeds the configured cardinality limit.
-				continue
-			}
 
 			if genTSID.generation < generation {
 				// The found TSID is from the previous indexdb. Create it in the current indexdb.
-				createAllIndexesForMetricName(idb, mn, &genTSID.TSID, date)
+				createAllIndexesForMetricName(idbCurr, mn, &genTSID.TSID, date)
 				genTSID.generation = generation
 				seriesRepopulated++
 			}
-			s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
+			s.storeTSIDToCache(&genTSID, mr.MetricNameRaw)
 			continue
 		}
 
-		// Slowest path - there is no TSID in indexdb for the given mr.MetricNameRaw. Create it.
+		// Slowest path - there isCurr no TSID in indexdb for the given mr.MetricNameRaw. Create it.
 		generateTSID(&genTSID.TSID, mn)
 
-		if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
-			// Skip the row, since it exceeds the configured cardinality limit.
-			continue
-		}
-
-		// Schedule creating TSID indexes instead of creating them synchronously.
-		// This should keep stable the ingestion rate when new time series are ingested.
-		createAllIndexesForMetricName(idb, mn, &genTSID.TSID, date)
+		createAllIndexesForMetricName(idbCurr, mn, &genTSID.TSID, date)
 		genTSID.generation = generation
-		s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
+		s.storeTSIDToCache(&genTSID, mr.MetricNameRaw)
 		newSeriesCount++
 	}
 
@@ -1739,11 +1973,14 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 }
 
 func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, precisionBits uint8) int {
-	idb, idbNext, putIndexDBs := s.getCurrAndNextIndexDBs()
-	defer putIndexDBs()
-	generation := idb.generation
-	is := idb.getIndexSearch(noDeadline)
-	defer idb.putIndexSearch(is)
+	logNewSeries := s.logNewSeries.Load() || s.logNewSeriesUntil.Load() >= fasttime.UnixTimestamp()
+	idbPrev, idbCurr, idbNext := s.getIndexDBs()
+	defer s.putIndexDBs(idbPrev, idbCurr, idbNext)
+	generation := idbCurr.generation
+	isCurr := idbCurr.getIndexSearch(noDeadline)
+	defer idbCurr.putIndexSearch(isCurr)
+	isPrev := idbPrev.getIndexSearch(noDeadline)
+	defer idbPrev.putIndexSearch(isPrev)
 
 	hmPrev := s.prevHourMetricIDs.Load()
 	hmCurr := s.currHourMetricIDs.Load()
@@ -1822,6 +2059,11 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 			r.TSID = prevTSID
 			continue
 		}
+		if !s.registerSeriesCardinality(mr.MetricNameRaw) {
+			// Skip row, since it exceeds cardinality limit
+			j--
+			continue
+		}
 
 		if s.getTSIDFromCache(&genTSID, mr.MetricNameRaw) {
 			// Fast path - the TSID for the given mr.MetricNameRaw has been found in cache and isn't deleted.
@@ -1829,11 +2071,6 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 			// contain MetricName->TSID entries for deleted time series.
 			// See Storage.DeleteSeries code for details.
 
-			if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
-				// Skip row, since it exceeds cardinality limit
-				j--
-				continue
-			}
 			r.TSID = genTSID.TSID
 			prevTSID = r.TSID
 			prevMetricNameRaw = mr.MetricNameRaw
@@ -1850,9 +2087,9 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 				}
 				mn.sortTags()
 
-				createAllIndexesForMetricName(idb, mn, &genTSID.TSID, date)
+				createAllIndexesForMetricName(idbCurr, mn, &genTSID.TSID, date)
 				genTSID.generation = generation
-				s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
+				s.storeTSIDToCache(&genTSID, mr.MetricNameRaw)
 				seriesRepopulated++
 				slowInsertsCount++
 			}
@@ -1881,22 +2118,16 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 		s.metricsTracker.RegisterIngestRequest(0, 0, mn.MetricGroup)
 
 		// Search for TSID for the given mr.MetricNameRaw in the indexdb.
-		if is.getTSIDByMetricName(&genTSID, metricNameBuf, date) {
+		if isCurr.getTSIDByMetricName(&genTSID, metricNameBuf, date) || isPrev.getTSIDByMetricName(&genTSID, metricNameBuf, date) {
 			// Slower path - the TSID has been found in indexdb.
-
-			if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
-				// Skip the row, since it exceeds the configured cardinality limit.
-				j--
-				continue
-			}
 
 			if genTSID.generation < generation {
 				// The found TSID is from the previous indexdb. Create it in the current indexdb.
-				createAllIndexesForMetricName(idb, mn, &genTSID.TSID, date)
+				createAllIndexesForMetricName(idbCurr, mn, &genTSID.TSID, date)
 				genTSID.generation = generation
 				seriesRepopulated++
 			}
-			s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
+			s.storeTSIDToCache(&genTSID, mr.MetricNameRaw)
 
 			r.TSID = genTSID.TSID
 			prevTSID = genTSID.TSID
@@ -1910,15 +2141,9 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 		// Slowest path - the TSID for the given mr.MetricNameRaw isn't found in indexdb. Create it.
 		generateTSID(&genTSID.TSID, mn)
 
-		if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
-			// Skip the row, since it exceeds the configured cardinality limit.
-			j--
-			continue
-		}
-
-		createAllIndexesForMetricName(idb, mn, &genTSID.TSID, date)
+		createAllIndexesForMetricName(idbCurr, mn, &genTSID.TSID, date)
 		genTSID.generation = generation
-		s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
+		s.storeTSIDToCache(&genTSID, mr.MetricNameRaw)
 		newSeriesCount++
 
 		r.TSID = genTSID.TSID
@@ -1951,7 +2176,7 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 		}
 	}
 
-	if err := s.updatePerDateData(idb, rows, dstMrs, hmPrev, hmCurr); err != nil {
+	if err := s.updatePerDateData(idbCurr, rows, dstMrs, hmPrev, hmCurr); err != nil {
 		if firstWarn == nil {
 			firstWarn = fmt.Errorf("cannot not update per-day index: %w", err)
 		}
@@ -1968,31 +2193,22 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 
 var storageAddRowsLogger = logger.WithThrottler("storageAddRows", 5*time.Second)
 
-// SetLogNewSeries updates new series logging.
-//
-// This function must be called before any calling any storage functions.
-func SetLogNewSeries(ok bool) {
-	logNewSeries = ok
+// SetLogNewSeriesUntil sets the timestamp until which new series will be logged.
+func (s *Storage) SetLogNewSeriesUntil(t uint64) {
+	s.logNewSeriesUntil.Store(t)
 }
-
-var logNewSeries = false
 
 func createAllIndexesForMetricName(db *indexDB, mn *MetricName, tsid *TSID, date uint64) {
 	db.createGlobalIndexes(tsid, mn)
 	db.createPerDayIndexes(date, tsid, mn)
 }
 
-func (s *Storage) putSeriesToCache(metricNameRaw []byte, genTSID *generationTSID, date uint64) {
-	// Store the TSID for the current indexdb into cache,
-	// so future rows for that TSID are ingested via fast path.
-	s.putTSIDToCache(genTSID, metricNameRaw)
+func (s *Storage) registerSeriesCardinality(metricNameRaw []byte) bool {
+	if s.hourlySeriesLimiter == nil && s.dailySeriesLimiter == nil {
+		return true
+	}
 
-	// Register the (generation, date, metricID) entry in the cache,
-	// so next time the entry is found there instead of searching for it in the indexdb.
-	s.dateMetricIDCache.Set(genTSID.generation, date, genTSID.TSID.MetricID)
-}
-
-func (s *Storage) registerSeriesCardinality(metricID uint64, metricNameRaw []byte) bool {
+	metricID := xxhash.Sum64(metricNameRaw)
 	if sl := s.hourlySeriesLimiter; sl != nil && !sl.Add(metricID) {
 		s.hourlySeriesLimitRowsDropped.Add(1)
 		logSkippedSeries(metricNameRaw, "-storage.maxHourlySeries", sl.MaxItems())
@@ -2030,16 +2246,16 @@ func getUserReadableMetricName(metricNameRaw []byte) string {
 
 func (s *Storage) prefillNextIndexDB(idbNext *indexDB, rows []rawRow, mrs []*MetricRow) error {
 	d := s.nextRetentionSeconds()
-	if d >= 3600 {
+	if d >= s.idbPrefillStartSeconds {
 		// Fast path: nothing to pre-fill because it is too early.
 		// The pre-fill is started during the last hour before the indexdb rotation.
 		return nil
 	}
 
-	// Slower path: less than hour left for the next indexdb rotation.
+	// Slower path: less than nextPrefillStartSeconds left for the next indexdb rotation.
 	// Pre-populate idbNext with the increasing probability until the rotation.
-	// The probability increases from 0% to 100% proportioinally to d=[3600 .. 0].
-	pMin := float64(d) / 3600
+	// The probability increases from 0% to 100% proportioinally to d=[nextPrefillStartSeconds .. 0].
+	pMin := float64(d) / float64(s.idbPrefillStartSeconds)
 
 	generation := idbNext.generation
 	isNext := idbNext.getIndexSearch(noDeadline)
@@ -2059,21 +2275,10 @@ func (s *Storage) prefillNextIndexDB(idbNext *indexDB, rows []rawRow, mrs []*Met
 			continue
 		}
 
-		// Check whether the given MetricID is already present in dateMetricIDCache.
+		// Check whether the given (date, metricID) is already present in idbNext.
 		date := s.date(r.Timestamp)
 		metricID := r.TSID.MetricID
-		if s.dateMetricIDCache.Has(generation, date, metricID) {
-			// Indexes are already pre-filled.
-			continue
-		}
-
-		// Check whether the given (date, metricID) is already present in idbNext.
-		if isNext.hasDateMetricIDNoExtDB(date, metricID) {
-			// Indexes are already pre-filled at idbNext.
-			//
-			// Register the (generation, date, metricID) entry in the cache,
-			// so next time the entry is found there instead of searching for it in the indexdb.
-			s.dateMetricIDCache.Set(generation, date, metricID)
+		if isNext.hasDateMetricID(date, metricID) {
 			continue
 		}
 
@@ -2091,7 +2296,7 @@ func (s *Storage) prefillNextIndexDB(idbNext *indexDB, rows []rawRow, mrs []*Met
 		createAllIndexesForMetricName(idbNext, mn, &r.TSID, date)
 		genTSID.TSID = r.TSID
 		genTSID.generation = generation
-		s.putSeriesToCache(metricNameRaw, &genTSID, date)
+		s.storeTSIDToCache(&genTSID, metricNameRaw)
 		timeseriesPreCreated++
 	}
 	s.timeseriesPreCreated.Add(timeseriesPreCreated)
@@ -2113,8 +2318,6 @@ func (s *Storage) updatePerDateData(idb *indexDB, rows []rawRow, mrs []*MetricRo
 		prevDate     uint64
 		prevMetricID uint64
 	)
-
-	generation := idb.generation
 
 	hmPrevDate := hmPrev.hour / 24
 	nextDayMetricIDs := &s.nextDayMetricIDs.Load().v
@@ -2172,8 +2375,13 @@ func (s *Storage) updatePerDateData(idb *indexDB, rows []rawRow, mrs []*MetricRo
 			}
 		}
 
-		// Slower path: check global cache for (generation, date, metricID) entry.
-		if s.dateMetricIDCache.Has(generation, date, metricID) {
+		// Slower path: check the dateMetricIDCache if the (date, metricID) pair
+		// is already present in indexDB.
+		//
+		// TODO(@rtm0): indexDB.dateMetricIDCache should not be used directly
+		// since its purpose is to optimize is.hasDateMetricID(). See if this
+		// function could be changed so that it does not rely on this cache.
+		if idb.dateMetricIDCache.Has(date, metricID) {
 			continue
 		}
 		// Slow path: store the (date, metricID) entry in the indexDB.
@@ -2210,12 +2418,11 @@ func (s *Storage) updatePerDateData(idb *indexDB, rows []rawRow, mrs []*MetricRo
 	defer idb.putIndexSearch(is)
 
 	var firstError error
-	dateMetricIDsForCache := make([]dateMetricID, 0, len(pendingDateMetricIDs))
 	mn := GetMetricName()
 	for _, dmid := range pendingDateMetricIDs {
 		date := dmid.date
 		metricID := dmid.tsid.MetricID
-		if !is.hasDateMetricIDNoExtDB(date, metricID) {
+		if !is.hasDateMetricID(date, metricID) {
 			// The (date, metricID) entry is missing in the indexDB. Add it there together with per-day index.
 			// It is OK if the (date, metricID) entry is added multiple times to indexdb
 			// by concurrent goroutines.
@@ -2229,14 +2436,8 @@ func (s *Storage) updatePerDateData(idb *indexDB, rows []rawRow, mrs []*MetricRo
 			mn.sortTags()
 			idb.createPerDayIndexes(date, dmid.tsid, mn)
 		}
-		dateMetricIDsForCache = append(dateMetricIDsForCache, dateMetricID{
-			date:     date,
-			metricID: metricID,
-		})
 	}
 	PutMetricName(mn)
-	// The (date, metricID) entries must be added to cache only after they have been successfully added to indexDB.
-	s.dateMetricIDCache.Store(generation, dateMetricIDsForCache)
 	return firstError
 }
 
@@ -2286,8 +2487,8 @@ func (dmc *dateMetricIDCache) resetLocked() {
 func (dmc *dateMetricIDCache) EntriesCount() int {
 	byDate := dmc.byDate.Load()
 	n := 0
-	for _, e := range byDate.m {
-		n += e.v.Len()
+	for _, metricIDs := range byDate.m {
+		n += metricIDs.Len()
 	}
 	return n
 }
@@ -2295,36 +2496,36 @@ func (dmc *dateMetricIDCache) EntriesCount() int {
 func (dmc *dateMetricIDCache) SizeBytes() uint64 {
 	byDate := dmc.byDate.Load()
 	n := uint64(0)
-	for _, e := range byDate.m {
-		n += e.v.SizeBytes()
+	for _, metricIDs := range byDate.m {
+		n += metricIDs.SizeBytes()
 	}
 	return n
 }
 
-func (dmc *dateMetricIDCache) Has(generation, date, metricID uint64) bool {
-	if byDate := dmc.byDate.Load(); byDate.get(generation, date).Has(metricID) {
+func (dmc *dateMetricIDCache) Has(date, metricID uint64) bool {
+	if byDate := dmc.byDate.Load(); byDate.get(date).Has(metricID) {
 		// Fast path. The majority of calls must go here.
 		return true
 	}
 	// Slow path. Acquire the lock and search the immutable map again and then
 	// also search the mutable map.
-	return dmc.hasSlow(generation, date, metricID)
+	return dmc.hasSlow(date, metricID)
 }
 
-func (dmc *dateMetricIDCache) hasSlow(generation, date, metricID uint64) bool {
+func (dmc *dateMetricIDCache) hasSlow(date, metricID uint64) bool {
 	dmc.mu.Lock()
 	defer dmc.mu.Unlock()
 
 	// First, check immutable map again because the entry may have been moved to
 	// the immutable map by the time the caller acquires the lock.
 	byDate := dmc.byDate.Load()
-	v := byDate.get(generation, date)
+	v := byDate.get(date)
 	if v.Has(metricID) {
 		return true
 	}
 
 	// Then check immutable map.
-	vMutable := dmc.byDateMutable.get(generation, date)
+	vMutable := dmc.byDateMutable.get(date)
 	ok := vMutable.Has(metricID)
 	if ok {
 		dmc.slowHits++
@@ -2337,37 +2538,9 @@ func (dmc *dateMetricIDCache) hasSlow(generation, date, metricID uint64) bool {
 	return ok
 }
 
-type dateMetricID struct {
-	date     uint64
-	metricID uint64
-}
-
-func (dmc *dateMetricIDCache) Store(generation uint64, dmids []dateMetricID) {
-	var prevDate uint64
-	metricIDs := make([]uint64, 0, len(dmids))
+func (dmc *dateMetricIDCache) Set(date, metricID uint64) {
 	dmc.mu.Lock()
-	for _, dmid := range dmids {
-		if prevDate == dmid.date {
-			metricIDs = append(metricIDs, dmid.metricID)
-			continue
-		}
-		if len(metricIDs) > 0 {
-			v := dmc.byDateMutable.getOrCreate(generation, prevDate)
-			v.AddMulti(metricIDs)
-		}
-		metricIDs = append(metricIDs[:0], dmid.metricID)
-		prevDate = dmid.date
-	}
-	if len(metricIDs) > 0 {
-		v := dmc.byDateMutable.getOrCreate(generation, prevDate)
-		v.AddMulti(metricIDs)
-	}
-	dmc.mu.Unlock()
-}
-
-func (dmc *dateMetricIDCache) Set(generation, date, metricID uint64) {
-	dmc.mu.Lock()
-	v := dmc.byDateMutable.getOrCreate(generation, date)
+	v := dmc.byDateMutable.getOrCreate(date)
 	v.Add(metricID)
 	dmc.mu.Unlock()
 }
@@ -2381,34 +2554,30 @@ func (dmc *dateMetricIDCache) syncLocked() {
 	// Merge data from byDate into byDateMutable and then atomically replace byDate with the merged data.
 	byDate := dmc.byDate.Load()
 	byDateMutable := dmc.byDateMutable
-	byDateMutable.hotEntry.Store(&byDateMetricIDEntry{})
+	byDateMutable.hotEntry.Store(nil)
 
 	keepDatesMap := make(map[uint64]struct{}, len(byDateMutable.m))
-	for k, e := range byDateMutable.m {
-		keepDatesMap[k.date] = struct{}{}
-		v := byDate.get(k.generation, k.date)
-		if v == nil {
+	for date, metricIDsMutable := range byDateMutable.m {
+		keepDatesMap[date] = struct{}{}
+		metricIDs := byDate.get(date)
+		if metricIDs == nil {
 			// Nothing to merge
 			continue
 		}
-		v = v.Clone()
-		v.Union(&e.v)
-		dme := &byDateMetricIDEntry{
-			k: k,
-			v: *v,
-		}
-		byDateMutable.m[k] = dme
+		metricIDs = metricIDs.Clone()
+		metricIDs.Union(metricIDsMutable)
+		byDateMutable.m[date] = metricIDs
 	}
 
 	// Copy entries from byDate, which are missing in byDateMutable
 	allDatesMap := make(map[uint64]struct{}, len(byDate.m))
-	for k, e := range byDate.m {
-		allDatesMap[k.date] = struct{}{}
-		v := byDateMutable.get(k.generation, k.date)
+	for date, metricIDs := range byDate.m {
+		allDatesMap[date] = struct{}{}
+		v := byDateMutable.get(date)
 		if v != nil {
 			continue
 		}
-		byDateMutable.m[k] = e
+		byDateMutable.m[date] = metricIDs
 	}
 
 	if len(byDateMutable.m) > 2 {
@@ -2426,9 +2595,9 @@ func (dmc *dateMetricIDCache) syncLocked() {
 		for _, date := range dates {
 			keepDatesMap[date] = struct{}{}
 		}
-		for k := range byDateMutable.m {
-			if _, ok := keepDatesMap[k.date]; !ok {
-				delete(byDateMutable.m, k)
+		for date := range byDateMutable.m {
+			if _, ok := keepDatesMap[date]; !ok {
+				delete(byDateMutable.m, date)
 			}
 		}
 	}
@@ -2444,57 +2613,57 @@ func (dmc *dateMetricIDCache) syncLocked() {
 	}
 }
 
+// dateMetricIDs holds the date and corresponding metricIDs together and is used
+// for implementing hot entry fast path in byDateMetricIDMap.
+type dateMetricIDs struct {
+	date      uint64
+	metricIDs *uint64set.Set
+}
+
 type byDateMetricIDMap struct {
-	hotEntry atomic.Pointer[byDateMetricIDEntry]
-	m        map[generationDateKey]*byDateMetricIDEntry
+	hotEntry atomic.Pointer[dateMetricIDs]
+	m        map[uint64]*uint64set.Set
+}
+
+func newByDateMetricIDMap() *byDateMetricIDMap {
+	dmm := &byDateMetricIDMap{
+		m: make(map[uint64]*uint64set.Set),
+	}
+	return dmm
+}
+
+func (dmm *byDateMetricIDMap) get(date uint64) *uint64set.Set {
+	hotEntry := dmm.hotEntry.Load()
+	if hotEntry != nil && hotEntry.date == date {
+		// Fast path
+		return hotEntry.metricIDs
+	}
+	// Slow path
+	metricIDs := dmm.m[date]
+	if metricIDs == nil {
+		return nil
+	}
+	e := &dateMetricIDs{
+		date:      date,
+		metricIDs: metricIDs,
+	}
+	dmm.hotEntry.Store(e)
+	return metricIDs
+}
+
+func (dmm *byDateMetricIDMap) getOrCreate(date uint64) *uint64set.Set {
+	metricIDs := dmm.get(date)
+	if metricIDs != nil {
+		return metricIDs
+	}
+	metricIDs = &uint64set.Set{}
+	dmm.m[date] = metricIDs
+	return metricIDs
 }
 
 type generationDateKey struct {
 	generation uint64
 	date       uint64
-}
-
-func newByDateMetricIDMap() *byDateMetricIDMap {
-	dmm := &byDateMetricIDMap{
-		m: make(map[generationDateKey]*byDateMetricIDEntry),
-	}
-	dmm.hotEntry.Store(&byDateMetricIDEntry{})
-	return dmm
-}
-
-func (dmm *byDateMetricIDMap) get(generation, date uint64) *uint64set.Set {
-	hotEntry := dmm.hotEntry.Load()
-	if hotEntry.k.generation == generation && hotEntry.k.date == date {
-		// Fast path
-		return &hotEntry.v
-	}
-	// Slow path
-	k := generationDateKey{
-		generation: generation,
-		date:       date,
-	}
-	e := dmm.m[k]
-	if e == nil {
-		return nil
-	}
-	dmm.hotEntry.Store(e)
-	return &e.v
-}
-
-func (dmm *byDateMetricIDMap) getOrCreate(generation, date uint64) *uint64set.Set {
-	v := dmm.get(generation, date)
-	if v != nil {
-		return v
-	}
-	k := generationDateKey{
-		generation: generation,
-		date:       date,
-	}
-	e := &byDateMetricIDEntry{
-		k: k,
-	}
-	dmm.m[k] = e
-	return &e.v
 }
 
 type byDateMetricIDEntry struct {
@@ -2588,14 +2757,13 @@ func (s *Storage) getTSIDFromCache(dst *generationTSID, metricName []byte) bool 
 	return uintptr(len(buf)) == unsafe.Sizeof(*dst)
 }
 
-func (s *Storage) putTSIDToCache(tsid *generationTSID, metricName []byte) {
+func (s *Storage) storeTSIDToCache(tsid *generationTSID, metricName []byte) {
 	buf := (*[unsafe.Sizeof(*tsid)]byte)(unsafe.Pointer(tsid))[:]
 	s.tsidCache.Set(metricName, buf)
 }
 
 func (s *Storage) mustOpenIndexDBTables(path string) (next, curr, prev *indexDB) {
 	fs.MustMkdirIfNotExist(path)
-	fs.MustRemoveTemporaryDirs(path)
 
 	// Search for the three most recent tables - the prev, curr and next.
 	des := fs.MustReadDir(path)
@@ -2608,6 +2776,13 @@ func (s *Storage) mustOpenIndexDBTables(path string) (next, curr, prev *indexDB)
 		tableName := de.Name()
 		if !indexDBTableNameRegexp.MatchString(tableName) {
 			// Skip invalid directories.
+			continue
+		}
+		tableDirPath := filepath.Join(path, tableName)
+		if fs.IsPartiallyRemovedDir(tableDirPath) {
+			// Finish the removal of partially deleted directory, which can occur
+			// when the directory was removed during unclean shutdown.
+			fs.MustRemoveDir(tableDirPath)
 			continue
 		}
 		tableNames = append(tableNames, tableName)
@@ -2633,7 +2808,7 @@ func (s *Storage) mustOpenIndexDBTables(path string) (next, curr, prev *indexDB)
 		for _, tn := range tableNames[:len(tableNames)-3] {
 			pathToRemove := filepath.Join(path, tn)
 			logger.Infof("removing obsolete indexdb dir %q...", pathToRemove)
-			fs.MustRemoveAll(pathToRemove)
+			fs.MustRemoveDir(pathToRemove)
 			logger.Infof("removed obsolete indexdb dir %q", pathToRemove)
 		}
 		fs.MustSyncPath(path)
@@ -2646,9 +2821,9 @@ func (s *Storage) mustOpenIndexDBTables(path string) (next, curr, prev *indexDB)
 	currPath := filepath.Join(path, tableNames[1])
 	prevPath := filepath.Join(path, tableNames[0])
 
-	next = mustOpenIndexDB(nextPath, s, &s.isReadOnly)
-	curr = mustOpenIndexDB(currPath, s, &s.isReadOnly)
-	prev = mustOpenIndexDB(prevPath, s, &s.isReadOnly)
+	next = mustOpenIndexDB(nextPath, s, &s.isReadOnly, false)
+	curr = mustOpenIndexDB(currPath, s, &s.isReadOnly, false)
+	prev = mustOpenIndexDB(prevPath, s, &s.isReadOnly, true)
 
 	return next, curr, prev
 }
@@ -2713,4 +2888,22 @@ func (s *Storage) GetMetricNamesStats(_ *querytracer.Tracer, limit, le int, matc
 // ResetMetricNamesStats resets state for metric names usage tracker
 func (s *Storage) ResetMetricNamesStats(_ *querytracer.Tracer) {
 	s.metricsTracker.Reset(s.tsidCache.Reset)
+}
+
+// GetMetadataRows returns time series metric names metadata for the given args
+func (s *Storage) GetMetadataRows(qt *querytracer.Tracer, limit int, metricName string) []*metricsmetadata.Row {
+	var (
+		res []*metricsmetadata.Row
+	)
+
+	qt = qt.NewChild("search metrics metadata rows limit=%d,metricName=%q", limit, metricName)
+	res = s.metadataStorage.Get(limit, metricName)
+	qt.Printf("found %d metadata rows", len(res))
+	qt.Done()
+	return res
+}
+
+// AddMetadataRows writes time series metric names metadata into storage
+func (s *Storage) AddMetadataRows(rows []metricsmetadata.Row) {
+	s.metadataStorage.Add(rows)
 }

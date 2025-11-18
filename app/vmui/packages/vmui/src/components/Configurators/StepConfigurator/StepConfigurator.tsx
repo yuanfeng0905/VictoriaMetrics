@@ -1,4 +1,4 @@
-import React, { FC, useEffect, useMemo, useRef, useState } from "preact/compat";
+import { FC, useEffect, useMemo, useRef, useState } from "preact/compat";
 import { ArrowDownIcon, RestartIcon, TimelineIcon } from "../../Main/Icons";
 import TextField from "../../Main/TextField/TextField";
 import Button from "../../Main/Button/Button";
@@ -142,7 +142,7 @@ const StepConfigurator: FC = () => {
           startIcon={<TimelineIcon/>}
           onClick={toggleOpenOptions}
         >
-            Step: {isAutoStep ? `auto (${customStep})` : customStep}
+          Step: {isAutoStep ? `auto (${customStep})` : customStep}
         </Button>
       )}
       <Popper

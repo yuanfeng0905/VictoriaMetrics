@@ -1,6 +1,6 @@
 import classNames from "classnames";
 import Button from "../../../components/Main/Button/Button";
-import React, { FC, useEffect } from "preact/compat";
+import { FC, useEffect } from "preact/compat";
 import useBoolean from "../../../hooks/useBoolean";
 import useDeviceDetect from "../../../hooks/useDeviceDetect";
 import Alert from "../../../components/Main/Alert/Alert";
@@ -40,7 +40,7 @@ const WarningLimitSeries: FC<Props> = ({ warning, query, onChange }) => {
           variant="outlined"
           onClick={handleShowAll}
         >
-        Show all
+          Show all
         </Button>
       </div>
     </Alert>

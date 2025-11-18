@@ -9,7 +9,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
 )
 
@@ -17,12 +17,12 @@ func TestAggregatorsSuccess(t *testing.T) {
 	f := func(inputMetrics []string, interval time.Duration, outputMetricsExpected, config, matchIdxsStrExpected string) {
 		t.Helper()
 		synctest.Run(func() {
-			var matchIdxs []byte
-			var tssOutput []prompbmarshal.TimeSeries
+			var matchIdxs []uint32
+			var tssOutput []prompb.TimeSeries
 			var tssOutputLock sync.Mutex
 
 			// Initialize Aggregators
-			pushFunc := func(tss []prompbmarshal.TimeSeries) {
+			pushFunc := func(tss []prompb.TimeSeries) {
 				tssOutputLock.Lock()
 				tssOutput = appendClonedTimeseries(tssOutput, tss)
 				tssOutputLock.Unlock()

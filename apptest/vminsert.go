@@ -2,6 +2,7 @@ package apptest
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -10,7 +11,8 @@ import (
 
 	"github.com/golang/snappy"
 
-	pb "github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prommetadata"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 )
 
 // Vminsert holds the state of a vminsert app and provides vminsert-specific
@@ -41,14 +43,14 @@ func storageNodes(flags []string) []string {
 // StartVminsert starts an instance of vminsert with the given flags. It also
 // sets the default flags and populates the app instance state with runtime
 // values extracted from the application log (such as httpListenAddr)
-func StartVminsert(instance string, flags []string, cli *Client) (*Vminsert, error) {
+func StartVminsert(instance string, flags []string, cli *Client, output io.Writer) (*Vminsert, error) {
 	extractREs := []*regexp.Regexp{
 		httpListenAddrRE,
 		vminsertClusterNativeAddrRE,
 		graphiteListenAddrRE,
 		openTSDBListenAddrRE,
 	}
-	// Add storateNode REs to block until vminsert establishes connections with
+	// Add storageNode REs to block until vminsert establishes connections with
 	// all storage nodes. The extracted values are unused.
 	for _, sn := range storageNodes(flags) {
 		logRecord := fmt.Sprintf("successfully dialed -storageNode=\"%s\"", sn)
@@ -57,12 +59,14 @@ func StartVminsert(instance string, flags []string, cli *Client) (*Vminsert, err
 
 	app, stderrExtracts, err := startApp(instance, "../../bin/vminsert", flags, &appOptions{
 		defaultFlags: map[string]string{
-			"-httpListenAddr":          "127.0.0.1:0",
-			"-clusternativeListenAddr": "127.0.0.1:0",
-			"-graphiteListenAddr":      ":0",
-			"-opentsdbListenAddr":      "127.0.0.1:0",
+			"-httpListenAddr":                              "127.0.0.1:0",
+			"-clusternativeListenAddr":                     "127.0.0.1:0",
+			"-graphiteListenAddr":                          ":0",
+			"-opentsdbListenAddr":                          "127.0.0.1:0",
+			"-clusternative.vminsertConnsShutdownDuration": "1ms",
 		},
 		extractREs: extractREs,
+		output:     output,
 	})
 	if err != nil {
 		return nil, err
@@ -198,13 +202,16 @@ func (app *Vminsert) OpenTSDBAPIPut(t *testing.T, records []string, opts QueryOp
 // PrometheusAPIV1Write is a test helper function that inserts a
 // collection of records in Prometheus remote-write format by sending a HTTP
 // POST request to /prometheus/api/v1/write vminsert endpoint.
-func (app *Vminsert) PrometheusAPIV1Write(t *testing.T, records []pb.TimeSeries, opts QueryOpts) {
+func (app *Vminsert) PrometheusAPIV1Write(t *testing.T, wr prompb.WriteRequest, opts QueryOpts) {
 	t.Helper()
 
 	url := fmt.Sprintf("http://%s/insert/%s/prometheus/api/v1/write", app.httpListenAddr, opts.getTenant())
-	wr := pb.WriteRequest{Timeseries: records}
 	data := snappy.Encode(nil, wr.MarshalProtobuf(nil))
-	app.sendBlocking(t, len(records), func() {
+	recordsCount := len(wr.Timeseries)
+	if prommetadata.IsEnabled() {
+		recordsCount += len(wr.Metadata)
+	}
+	app.sendBlocking(t, recordsCount, func() {
 		_, statusCode := app.cli.Post(t, url, "application/x-protobuf", data)
 		if statusCode != http.StatusNoContent {
 			t.Fatalf("unexpected status code: got %d, want %d", statusCode, http.StatusNoContent)
@@ -228,7 +235,19 @@ func (app *Vminsert) PrometheusAPIV1ImportPrometheus(t *testing.T, records []str
 		url += "?" + uvs
 	}
 	data := []byte(strings.Join(records, "\n"))
-	app.sendBlocking(t, len(records), func() {
+	var recordsCount int
+	var metadataRecords int
+	for _, record := range records {
+		if strings.HasPrefix(record, "#") {
+			metadataRecords++
+			continue
+		}
+		recordsCount++
+	}
+	if prommetadata.IsEnabled() {
+		recordsCount += metadataRecords
+	}
+	app.sendBlocking(t, recordsCount, func() {
 		_, statusCode := app.cli.Post(t, url, "text/plain", data)
 		if statusCode != http.StatusNoContent {
 			t.Fatalf("unexpected status code: got %d, want %d", statusCode, http.StatusNoContent)
@@ -265,7 +284,8 @@ func (app *Vminsert) sendBlocking(t *testing.T, numRecordsToSend int, send func(
 	)
 	wantRowsSentCount := app.rpcRowsSentTotal(t) + numRecordsToSend
 	for range retries {
-		if app.rpcRowsSentTotal(t) >= wantRowsSentCount {
+		d := app.rpcRowsSentTotal(t)
+		if d >= wantRowsSentCount {
 			return
 		}
 		time.Sleep(period)

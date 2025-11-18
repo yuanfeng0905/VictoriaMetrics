@@ -15,7 +15,7 @@ menu:
 - [Cortex](https://docs.victoriametrics.com/victoriametrics/vmctl/cortex/)
 - [Mimir](https://docs.victoriametrics.com/victoriametrics/vmctl/mimir/)
 - [Promscale](https://docs.victoriametrics.com/victoriametrics/vmctl/promscale/)
-- [Thanos](https://docs.victoriametrics.com/victoriametrics/vmctl/thanos#remote-read-protocol)
+- [Thanos](https://docs.victoriametrics.com/victoriametrics/vmctl/thanos/#remote-read-protocol)
 
 Remote read API has two implementations of remote read API: default (`SAMPLES`) and
 [streamed](https://prometheus.io/blog/2019/10/10/remote-read-meets-streaming/) (`STREAMED_XOR_CHUNKS`).
@@ -36,7 +36,7 @@ The importing process example for local installation of Prometheus:
 --vm-addr=http://<victoria-metrics>:8428 \
 ```
 
-_See how to configure [--vm-addr](https://docs.victoriametrics.com/victoriametrics/vmctl#configuring-victoriametrics)._
+_See how to configure [--vm-addr](https://docs.victoriametrics.com/victoriametrics/vmctl/#configuring-victoriametrics)._
 
 ## Filtering
 
@@ -46,6 +46,15 @@ in RFC3339 format.
 Filtering by labels can be configured via flags `--remote-read-filter-label` and `--remote-read-filter-label-value`.
 For example, `--remote-read-filter-label=tenant` and `--remote-read-filter-label-value="team-eu"` will select only series
 with `tenant="team-eu"` label-value pair.
+
+Filtering flags can be provided multiple times {{% available_from "v1.129.0" %}} to narrow down the selection of timeseries to migrate.
+For example:
+```sh
+./vmctl remote-read \
+    --remote-read-filter-label=tenant --remote-read-filter-label-value="team-eu" \
+    --remote-read-filter-label=__name__ --remote-read-filter-label-value="cpu_.*"
+```
+will select only timeseries with `tenant="team-eu"` label and metric names matching `cpu_.*` regex.
 
 ## Configuration 
 

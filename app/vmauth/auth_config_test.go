@@ -280,7 +280,7 @@ users:
 }
 
 func TestParseAuthConfigSuccess(t *testing.T) {
-	f := func(s string, expectedAuthConfig map[string]*UserInfo) {
+	f := func(s string, expectedAuthConfig map[string]*UserInfo, expectedUnauthorizedUserConfig *UserInfo) {
 		t.Helper()
 		ac, err := parseAuthConfig([]byte(s))
 		if err != nil {
@@ -294,15 +294,19 @@ func TestParseAuthConfigSuccess(t *testing.T) {
 		if err := areEqualConfigs(m, expectedAuthConfig); err != nil {
 			t.Fatal(err)
 		}
+
+		if err := areEqualConfigs(ac.UnauthorizedUser, expectedUnauthorizedUserConfig); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	insecureSkipVerifyTrue := true
 
 	// Empty config
-	f(``, map[string]*UserInfo{})
+	f(``, map[string]*UserInfo{}, nil)
 
 	// Empty users
-	f(`users: []`, map[string]*UserInfo{})
+	f(`users: []`, map[string]*UserInfo{}, nil)
 
 	// Single user
 	f(`
@@ -320,7 +324,7 @@ users:
 			MaxConcurrentRequests: 5,
 			TLSInsecureSkipVerify: &insecureSkipVerifyTrue,
 		},
-	})
+	}, nil)
 
 	// Single user with auth_token
 	f(`
@@ -344,7 +348,7 @@ users:
 			TLSCertFile:           "foo/baz",
 			TLSKeyFile:            "foo/foo",
 		},
-	})
+	}, nil)
 
 	// Multiple url_prefix entries
 	insecureSkipVerifyFalse := false
@@ -359,6 +363,7 @@ users:
   tls_insecure_skip_verify: false
   retry_status_codes: [500, 501]
   load_balancing_policy: first_available
+  merge_query_args: [foo, bar]
   drop_src_path_prefix_parts: 1
   discover_backend_ips: true
 `, map[string]*UserInfo{
@@ -372,10 +377,11 @@ users:
 			TLSInsecureSkipVerify:  &insecureSkipVerifyFalse,
 			RetryStatusCodes:       []int{500, 501},
 			LoadBalancingPolicy:    "first_available",
+			MergeQueryArgs:         []string{"foo", "bar"},
 			DropSrcPathPrefixParts: intp(1),
 			DiscoverBackendIPs:     &discoverBackendIPsTrue,
 		},
-	})
+	}, nil)
 
 	// Multiple users
 	f(`
@@ -393,7 +399,7 @@ users:
 			Username:  "bar",
 			URLPrefix: mustParseURL("https://bar/x/"),
 		},
-	})
+	}, nil)
 
 	// non-empty URLMap
 	sharedUserInfo := &UserInfo{
@@ -443,7 +449,7 @@ users:
 `, map[string]*UserInfo{
 		getHTTPAuthBearerToken("foo"):    sharedUserInfo,
 		getHTTPAuthBasicToken("foo", ""): sharedUserInfo,
-	})
+	}, nil)
 
 	// Multiple users with the same name - this should work, since these users have different passwords
 	f(`
@@ -465,7 +471,7 @@ users:
 			Password:  "bar",
 			URLPrefix: mustParseURL("https://bar/x"),
 		},
-	})
+	}, nil)
 
 	// with default url
 	keepOriginalHost := true
@@ -481,6 +487,8 @@ users:
     - "foo: bar"
     - "xxx: y"
     keep_original_host: true
+    load_balancing_policy: first_available
+    merge_query_args: [foo, bar]
   default_url:
   - http://default1/select/0/prometheus
   - http://default2/select/0/prometheus
@@ -505,6 +513,8 @@ users:
 						},
 						KeepOriginalHost: &keepOriginalHost,
 					},
+					LoadBalancingPolicy: "first_available",
+					MergeQueryArgs:      []string{"foo", "bar"},
 				},
 			},
 			DefaultURL: mustParseURLs([]string{
@@ -532,6 +542,8 @@ users:
 						},
 						KeepOriginalHost: &keepOriginalHost,
 					},
+					LoadBalancingPolicy: "first_available",
+					MergeQueryArgs:      []string{"foo", "bar"},
 				},
 			},
 			DefaultURL: mustParseURLs([]string{
@@ -539,7 +551,7 @@ users:
 				"http://default2/select/0/prometheus",
 			}),
 		},
-	})
+	}, nil)
 
 	// With metric_labels
 	f(`
@@ -589,6 +601,23 @@ users:
 				ResponseHeaders: []*Header{
 					mustNewHeader("'Abc: def'"),
 				},
+			},
+		},
+	}, nil)
+
+	// unauthorized_user
+	f(`
+unauthorized_user:
+  merge_query_args: [extra_filters]
+  url_map:
+  - src_paths: ["/select/.+"]
+    url_prefix: 'http://victoria-logs:9428/?extra_filters={env="prod"}'
+`, nil, &UserInfo{
+		MergeQueryArgs: []string{"extra_filters"},
+		URLMaps: []URLMap{
+			{
+				SrcPaths:  getRegexs([]string{"/select/.+"}),
+				URLPrefix: mustParseURL(`http://victoria-logs:9428/?extra_filters={env="prod"}`),
 			},
 		},
 	})
@@ -723,10 +752,12 @@ func TestGetLeastLoadedBackendURL(t *testing.T) {
 	})
 	up.loadBalancingPolicy = "least_loaded"
 
+	pbus := up.bus.Load()
+	bus := *pbus
+
 	fn := func(ns ...int) {
 		t.Helper()
-		pbus := up.bus.Load()
-		bus := *pbus
+
 		for i, b := range bus {
 			got := int(b.concurrentRequests.Load())
 			exp := ns[i]
@@ -738,45 +769,52 @@ func TestGetLeastLoadedBackendURL(t *testing.T) {
 
 	up.getBackendURL()
 	fn(1, 0, 0)
+
 	up.getBackendURL()
 	fn(1, 1, 0)
+
 	up.getBackendURL()
 	fn(1, 1, 1)
 
-	up.getBackendURL()
-	up.getBackendURL()
-	fn(2, 2, 1)
-
-	bus := up.bus.Load()
-	pbus := *bus
-	pbus[0].concurrentRequests.Add(2)
-	pbus[2].concurrentRequests.Add(5)
-	fn(4, 2, 6)
+	bus[1].put()
+	bus[2].put()
+	fn(1, 0, 0)
 
 	up.getBackendURL()
-	fn(4, 3, 6)
+	fn(1, 1, 0)
 
+	bus[1].put()
 	up.getBackendURL()
-	fn(4, 4, 6)
-
-	up.getBackendURL()
-	fn(4, 5, 6)
-
-	up.getBackendURL()
-	fn(5, 5, 6)
-
-	up.getBackendURL()
-	fn(6, 5, 6)
-
-	up.getBackendURL()
-	fn(6, 6, 6)
-
-	up.getBackendURL()
-	fn(6, 6, 7)
+	fn(1, 0, 1)
 
 	up.getBackendURL()
 	up.getBackendURL()
-	fn(7, 7, 7)
+	fn(1, 1, 2)
+
+	bus[0].concurrentRequests.Add(2)
+	bus[2].concurrentRequests.Add(2)
+	fn(3, 1, 4)
+
+	up.getBackendURL()
+	fn(3, 2, 4)
+
+	up.getBackendURL()
+	fn(3, 3, 4)
+
+	up.getBackendURL()
+	fn(4, 3, 4)
+
+	up.getBackendURL()
+	fn(4, 4, 4)
+
+	bus[0].put()
+	bus[2].put()
+
+	up.getBackendURL()
+	fn(3, 4, 4)
+
+	up.getBackendURL()
+	fn(4, 4, 4)
 }
 
 func TestBrokenBackend(t *testing.T) {
@@ -884,7 +922,7 @@ func removeMetrics(m map[string]*UserInfo) {
 	}
 }
 
-func areEqualConfigs(a, b map[string]*UserInfo) error {
+func areEqualConfigs(a, b any) error {
 	aData, err := yaml.Marshal(a)
 	if err != nil {
 		return fmt.Errorf("cannot marshal a: %w", err)

@@ -1,4 +1,4 @@
-import React, { FC, useMemo, useRef, useState } from "preact/compat";
+import { FC, useMemo, useRef, useState } from "preact/compat";
 import { InstantMetricResult } from "../../../api/types";
 import { InstantDataSeries } from "../../../types";
 import { useSortedCategories } from "../../../hooks/useSortedCategories";
@@ -128,7 +128,7 @@ const TableView: FC<GraphViewProps> = ({ data, displayColumns }) => {
                 >
                   <ArrowDropDownIcon/>
                 </div>
-            Value
+                Value
               </div>
             </td>
             {hasCopyValue && <td className="vm-table-cell vm-table-cell_header"/>}

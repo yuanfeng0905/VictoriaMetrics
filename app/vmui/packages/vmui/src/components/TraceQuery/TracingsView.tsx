@@ -1,4 +1,4 @@
-import React, { FC, useState } from "preact/compat";
+import { FC, useState } from "preact/compat";
 import Trace from "./Trace";
 import Button from "../Main/Button/Button";
 import { CodeIcon, CollapseIcon, DeleteIcon, DownloadIcon, ExpandIcon } from "../Main/Icons";
@@ -75,7 +75,7 @@ const TracingsView: FC<TraceViewProps> = ({ traces, jsonEditor = false, onDelete
           >
             <div className="vm-tracings-view-trace-header">
               <h3 className="vm-tracings-view-trace-header-title">
-              Trace for <b className="vm-tracings-view-trace-header-title__query">{trace.queryValue}</b>
+                Trace for <b className="vm-tracings-view-trace-header-title__query">{trace.queryValue}</b>
               </h3>
               <Tooltip title={expandedTraces.includes(trace.idValue) ? "Collapse All" : "Expand All"}>
                 <Button

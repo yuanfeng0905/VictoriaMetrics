@@ -820,17 +820,11 @@ func seekFirstTimestampIdxAfter(timestamps []int64, seekTimestamp int64, nHint i
 	if len(timestamps) == 0 || timestamps[0] > seekTimestamp {
 		return 0
 	}
-	startIdx := nHint - 2
-	if startIdx < 0 {
-		startIdx = 0
-	}
+	startIdx := max(nHint-2, 0)
 	if startIdx >= len(timestamps) {
 		startIdx = len(timestamps) - 1
 	}
-	endIdx := nHint + 2
-	if endIdx > len(timestamps) {
-		endIdx = len(timestamps)
-	}
+	endIdx := min(nHint+2, len(timestamps))
 	if startIdx > 0 && timestamps[startIdx] <= seekTimestamp {
 		timestamps = timestamps[startIdx:]
 		endIdx -= startIdx
@@ -918,18 +912,15 @@ func getMaxPrevInterval(scrapeInterval int64) int64 {
 	return scrapeInterval + scrapeInterval/8
 }
 
-// removeCounterResets removes resets for rollup functions over counters - see rollupFuncsRemoveCounterResets
-// it doesn't remove resets between samples with staleNaNs, or samples that exceed maxStalenessInterval
 func removeCounterResets(values []float64, timestamps []int64, maxStalenessInterval int64) {
+	// There is no need in handling NaNs here, since they are impossible
+	// on values from vmstorage.
 	if len(values) == 0 {
 		return
 	}
 	var correction float64
 	prevValue := values[0]
 	for i, v := range values {
-		if decimal.IsStaleNaN(v) {
-			continue
-		}
 		d := v - prevValue
 		if d < 0 {
 			if (-d * 8) < prevValue {
@@ -1861,13 +1852,8 @@ func rollupIncreasePure(rfa *rollupFuncArg) float64 {
 
 func rollupDelta(rfa *rollupFuncArg) float64 {
 	// There is no need in handling NaNs here, since they must be cleaned up
-	// before calling rollup funcs. Only StaleNaNs could remain in values - see dropStaleNaNs().
+	// before calling rollup funcs.
 	values := rfa.values
-	if len(values) > 0 && decimal.IsStaleNaN(values[len(values)-1]) {
-		// if last sample on interval is staleness marker then the selected series is expected
-		// to stop rendering immediately. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8891
-		return nan
-	}
 	prevValue := rfa.prevValue
 	if math.IsNaN(prevValue) {
 		if len(values) == 0 {
@@ -1961,13 +1947,8 @@ func rollupDerivFastPrometheus(rfa *rollupFuncArg) float64 {
 
 func rollupDerivFast(rfa *rollupFuncArg) float64 {
 	// There is no need in handling NaNs here, since they must be cleaned up
-	// before calling rollup funcs. Only StaleNaNs could remain in values - see  - see dropStaleNaNs().
+	// before calling rollup funcs.
 	values := rfa.values
-	if len(values) > 0 && decimal.IsStaleNaN(values[len(values)-1]) {
-		// if last sample on interval is staleness marker then the selected series is expected
-		// to stop rendering immediately. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8891
-		return nan
-	}
 	timestamps := rfa.timestamps
 	prevValue := rfa.prevValue
 	prevTimestamp := rfa.prevTimestamp
@@ -2456,13 +2437,14 @@ func rollupFake(_ *rollupFuncArg) float64 {
 	return 0
 }
 
+// getScalar expects result from a [scalar](https://prometheus.io/docs/prometheus/latest/querying/basics/#expression-language-data-types).
 func getScalar(arg any, argNum int) ([]float64, error) {
 	ts, ok := arg.([]*timeseries)
 	if !ok {
-		return nil, fmt.Errorf(`unexpected type for arg #%d; got %T; want %T`, argNum+1, arg, ts)
+		return nil, fmt.Errorf(`arg #%d must be a scalar`, argNum+1)
 	}
 	if len(ts) != 1 {
-		return nil, fmt.Errorf(`arg #%d must contain a single timeseries; got %d timeseries`, argNum+1, len(ts))
+		return nil, fmt.Errorf(`arg #%d must be a scalar`, argNum+1)
 	}
 	return ts[0].Values, nil
 }
@@ -2479,14 +2461,15 @@ func getIntNumber(arg any, argNum int) (int, error) {
 	return n, nil
 }
 
+// getString expects result from a string expression, which contains a single timeseries with only NaN values.
 func getString(tss []*timeseries, argNum int) (string, error) {
 	if len(tss) != 1 {
-		return "", fmt.Errorf(`arg #%d must contain a single timeseries; got %d timeseries`, argNum+1, len(tss))
+		return "", fmt.Errorf(`arg #%d must be a string`, argNum+1)
 	}
 	ts := tss[0]
 	for _, v := range ts.Values {
 		if !math.IsNaN(v) {
-			return "", fmt.Errorf(`arg #%d contains non-string timeseries`, argNum+1)
+			return "", fmt.Errorf(`arg #%d must be a string`, argNum+1)
 		}
 	}
 	return string(ts.MetricName.MetricGroup), nil

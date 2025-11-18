@@ -1,10 +1,11 @@
-import React, { Dispatch, FC, SetStateAction, useEffect, useState } from "preact/compat";
+import { Dispatch, FC, SetStateAction, useEffect, useState } from "preact/compat";
 import QueryEditor from "../../../components/Configurators/QueryEditor/QueryEditor";
 import AdditionalSettings from "../../../components/Configurators/AdditionalSettings/AdditionalSettings";
 import usePrevious from "../../../hooks/usePrevious";
-import { MAX_QUERIES_HISTORY, MAX_QUERY_FIELDS } from "../../../constants/graph";
+import { MAX_QUERY_FIELDS } from "../../../constants/graph";
 import { useQueryDispatch, useQueryState } from "../../../state/query/QueryStateContext";
 import { useTimeDispatch } from "../../../state/time/TimeStateContext";
+import { getQueryStringValue } from "../../../utils/query-string";
 import {
   DeleteIcon,
   PlayIcon,
@@ -21,6 +22,7 @@ import classNames from "classnames";
 import { MouseEvent as ReactMouseEvent } from "react";
 import { arrayEquals } from "../../../utils/array";
 import useDeviceDetect from "../../../hooks/useDeviceDetect";
+import useSearchParamsFromObject from "../../../hooks/useSearchParamsFromObject";
 import { QueryStats } from "../../../api/types";
 import { usePrettifyQuery } from "./hooks/usePrettifyQuery";
 import QueryHistory from "../../../components/QueryHistory/QueryHistory";
@@ -29,7 +31,7 @@ import QueryEditorAutocomplete from "../../../components/Configurators/QueryEdit
 import { getUpdatedHistory } from "../../../components/QueryHistory/utils";
 
 export interface QueryConfiguratorProps {
-  queryErrors: string[];
+  queryErrors?: string[];
   setQueryErrors: Dispatch<SetStateAction<string[]>>;
   setHideError: Dispatch<SetStateAction<boolean>>;
   stats: QueryStats[];
@@ -50,6 +52,9 @@ export interface QueryConfiguratorProps {
   }
 }
 
+const defaultHideQueryStr = getQueryStringValue("expr.hide", "") as string;
+const defaultHideQuery: number[] = defaultHideQueryStr.split(",").filter(v => v).map(Number);
+
 const QueryConfigurator: FC<QueryConfiguratorProps> = ({
   queryErrors,
   setQueryErrors,
@@ -69,9 +74,10 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
   const { query, queryHistory, autocomplete, autocompleteQuick } = useQueryState();
   const queryDispatch = useQueryDispatch();
   const timeDispatch = useTimeDispatch();
+  const { setSearchParamsFromKeys } = useSearchParamsFromObject();
 
   const [stateQuery, setStateQuery] = useState(query || []);
-  const [hideQuery, setHideQuery] = useState<number[]>([]);
+  const [hideQuery, setHideQuery] = useState<number[]>(defaultHideQuery);
   const [awaitStateQuery, setAwaitStateQuery] = useState(false);
   const prevStateQuery = usePrevious(stateQuery) as (undefined | string[]);
 
@@ -176,6 +182,7 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
 
   useEffect(() => {
     onHideQuery && onHideQuery(hideQuery);
+    setSearchParamsFromKeys({ "expr.hide": hideQuery.join(",") });
   }, [hideQuery]);
 
   useEffect(() => {
@@ -210,7 +217,7 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
             value={stateQuery[i]}
             autocomplete={!hideButtons?.autocomplete && (autocomplete || autocompleteQuick)}
             autocompleteEl={QueryEditorAutocomplete}
-            error={queryErrors[i]}
+            error={queryErrors && queryErrors[i]}
             stats={stats[i]}
             onArrowUp={createHandlerArrow(-1, i)}
             onArrowDown={createHandlerArrow(1, i)}

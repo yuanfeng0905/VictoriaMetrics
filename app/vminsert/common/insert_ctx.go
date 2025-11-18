@@ -10,10 +10,12 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ratelimiter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage/metricsmetadata"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeserieslimits"
 )
 
@@ -50,8 +52,9 @@ var (
 type InsertCtx struct {
 	Labels sortedLabels
 
-	mrs            []storage.MetricRow
-	metricNamesBuf []byte
+	mrs           []storage.MetricRow
+	mms           []metricsmetadata.Row
+	metricNameBuf []byte
 
 	relabelCtx    relabel.Ctx
 	streamAggrCtx streamAggrCtx
@@ -63,7 +66,7 @@ type InsertCtx struct {
 func (ctx *InsertCtx) Reset(rowsLen int) {
 	labels := ctx.Labels
 	for i := range labels {
-		labels[i] = prompbmarshal.Label{}
+		labels[i] = prompb.Label{}
 	}
 	ctx.Labels = labels[:0]
 
@@ -73,8 +76,13 @@ func (ctx *InsertCtx) Reset(rowsLen int) {
 	}
 	mrs = slicesutil.SetLength(mrs, rowsLen)
 	ctx.mrs = mrs[:0]
+	mms := ctx.mms
+	for i := range mms {
+		cleanMetricMetadata(&mms[i])
+	}
+	ctx.mms = mms[:0]
 
-	ctx.metricNamesBuf = ctx.metricNamesBuf[:0]
+	ctx.metricNameBuf = ctx.metricNameBuf[:0]
 	ctx.relabelCtx.Reset()
 	ctx.streamAggrCtx.Reset()
 	ctx.skipStreamAggr = false
@@ -84,11 +92,20 @@ func cleanMetricRow(mr *storage.MetricRow) {
 	mr.MetricNameRaw = nil
 }
 
-func (ctx *InsertCtx) marshalMetricNameRaw(prefix []byte, labels []prompbmarshal.Label) []byte {
-	start := len(ctx.metricNamesBuf)
-	ctx.metricNamesBuf = append(ctx.metricNamesBuf, prefix...)
-	ctx.metricNamesBuf = storage.MarshalMetricNameRaw(ctx.metricNamesBuf, labels)
-	metricNameRaw := ctx.metricNamesBuf[start:]
+func cleanMetricMetadata(mm *metricsmetadata.Row) {
+	mm.MetricFamilyName = nil
+	mm.Unit = nil
+	mm.Help = nil
+	mm.Type = 0
+	mm.ProjectID = 0
+	mm.AccountID = 0
+}
+
+func (ctx *InsertCtx) marshalMetricNameRaw(prefix []byte, labels []prompb.Label) []byte {
+	start := len(ctx.metricNameBuf)
+	ctx.metricNameBuf = append(ctx.metricNameBuf, prefix...)
+	ctx.metricNameBuf = storage.MarshalMetricNameRaw(ctx.metricNameBuf, labels)
+	metricNameRaw := ctx.metricNameBuf[start:]
 	return metricNameRaw[:len(metricNameRaw):len(metricNameRaw)]
 }
 
@@ -113,7 +130,7 @@ func (ctx *InsertCtx) TryPrepareLabels(hasRelabeling bool) bool {
 // WriteDataPoint writes (timestamp, value) with the given prefix and labels into ctx buffer.
 //
 // caller should invoke TryPrepareLabels before using this function if needed
-func (ctx *InsertCtx) WriteDataPoint(prefix []byte, labels []prompbmarshal.Label, timestamp int64, value float64) error {
+func (ctx *InsertCtx) WriteDataPoint(prefix []byte, labels []prompb.Label, timestamp int64, value float64) error {
 	metricNameRaw := ctx.marshalMetricNameRaw(prefix, labels)
 	return ctx.addRow(metricNameRaw, timestamp, value)
 }
@@ -123,7 +140,7 @@ func (ctx *InsertCtx) WriteDataPoint(prefix []byte, labels []prompbmarshal.Label
 // caller must invoke TryPrepareLabels before using this function
 //
 // It returns metricNameRaw for the given labels if len(metricNameRaw) == 0.
-func (ctx *InsertCtx) WriteDataPointExt(metricNameRaw []byte, labels []prompbmarshal.Label, timestamp int64, value float64) ([]byte, error) {
+func (ctx *InsertCtx) WriteDataPointExt(metricNameRaw []byte, labels []prompb.Label, timestamp int64, value float64) ([]byte, error) {
 	if len(metricNameRaw) == 0 {
 		metricNameRaw = ctx.marshalMetricNameRaw(nil, labels)
 	}
@@ -143,9 +160,58 @@ func (ctx *InsertCtx) addRow(metricNameRaw []byte, timestamp int64, value float6
 	mr.MetricNameRaw = metricNameRaw
 	mr.Timestamp = timestamp
 	mr.Value = value
-	if len(ctx.metricNamesBuf) > 16*1024*1024 {
+	if len(ctx.metricNameBuf) > 16*1024*1024 {
 		if err := ctx.FlushBufs(); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// WriteMetadata writes given prometheus protobuf  metadata into the storage.
+func (ctx *InsertCtx) WriteMetadata(mmpbs []prompb.MetricMetadata) error {
+	if len(mmpbs) == 0 {
+		return nil
+	}
+	mms := ctx.mms
+	mms = slicesutil.SetLength(mms, len(mmpbs))
+	for idx, mmpb := range mmpbs {
+		mm := &mms[idx]
+		mm.MetricFamilyName = bytesutil.ToUnsafeBytes(mmpb.MetricFamilyName)
+		mm.Help = bytesutil.ToUnsafeBytes(mmpb.Help)
+		mm.Type = mmpb.Type
+		mm.Unit = bytesutil.ToUnsafeBytes(mmpb.Unit)
+	}
+
+	err := vmstorage.AddMetadataRows(mms)
+	if err != nil {
+		return &httpserver.ErrorWithStatusCode{
+			Err:        fmt.Errorf("cannot store metrics metadata: %w", err),
+			StatusCode: http.StatusServiceUnavailable,
+		}
+	}
+	return nil
+}
+
+// WritePromMetadata writes given prometheus metric metadata into the storage
+func (ctx *InsertCtx) WritePromMetadata(mmps []prometheus.Metadata) error {
+	if len(mmps) == 0 {
+		return nil
+	}
+	mms := ctx.mms
+	mms = slicesutil.SetLength(mms, len(mmps))
+	for idx, mmpb := range mmps {
+		mm := &mms[idx]
+		mm.MetricFamilyName = bytesutil.ToUnsafeBytes(mmpb.Metric)
+		mm.Help = bytesutil.ToUnsafeBytes(mmpb.Help)
+		mm.Type = mmpb.Type
+	}
+
+	err := vmstorage.AddMetadataRows(mms)
+	if err != nil {
+		return &httpserver.ErrorWithStatusCode{
+			Err:        fmt.Errorf("cannot store prometheus metrics metadata: %w", err),
+			StatusCode: http.StatusServiceUnavailable,
 		}
 	}
 	return nil
@@ -161,7 +227,7 @@ func (ctx *InsertCtx) AddLabelBytes(name, value []byte) {
 		// Do not skip labels with empty name, since they are equal to __name__.
 		return
 	}
-	ctx.Labels = append(ctx.Labels, prompbmarshal.Label{
+	ctx.Labels = append(ctx.Labels, prompb.Label{
 		// Do not copy name and value contents for performance reasons.
 		// This reduces GC overhead on the number of objects and allocations.
 		Name:  bytesutil.ToUnsafeString(name),
@@ -179,7 +245,7 @@ func (ctx *InsertCtx) AddLabel(name, value string) {
 		// Do not skip labels with empty name, since they are equal to __name__.
 		return
 	}
-	ctx.Labels = append(ctx.Labels, prompbmarshal.Label{
+	ctx.Labels = append(ctx.Labels, prompb.Label{
 		// Do not copy name and value contents for performance reasons.
 		// This reduces GC overhead on the number of objects and allocations.
 		Name:  name,
@@ -221,7 +287,7 @@ func (ctx *InsertCtx) FlushBufs() error {
 	}
 }
 
-func (ctx *InsertCtx) dropAggregatedRows(matchIdxs []byte) {
+func (ctx *InsertCtx) dropAggregatedRows(matchIdxs []uint32) {
 	dst := ctx.mrs[:0]
 	src := ctx.mrs
 	if !*streamAggrDropInput {
@@ -239,4 +305,4 @@ func (ctx *InsertCtx) dropAggregatedRows(matchIdxs []byte) {
 	ctx.mrs = dst
 }
 
-var matchIdxsPool bytesutil.ByteBufferPool
+var matchIdxsPool slicesutil.BufferPool[uint32]

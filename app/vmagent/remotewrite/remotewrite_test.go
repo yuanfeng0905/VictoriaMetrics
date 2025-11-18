@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/consistenthash"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/streamaggr"
@@ -25,14 +27,14 @@ func TestGetLabelsHash_Distribution(t *testing.T) {
 		// Distribute itemsCount hashes returned by getLabelsHash() across bucketsCount buckets.
 		itemsCount := 1_000 * bucketsCount
 		m := make([]int, bucketsCount)
-		var labels []prompbmarshal.Label
+		var labels []prompb.Label
 		for i := 0; i < itemsCount; i++ {
-			labels = append(labels[:0], prompbmarshal.Label{
+			labels = append(labels[:0], prompb.Label{
 				Name:  "__name__",
 				Value: fmt.Sprintf("some_name_%d", i),
 			})
 			for j := 0; j < 10; j++ {
-				labels = append(labels, prompbmarshal.Label{
+				labels = append(labels, prompb.Label{
 					Name:  fmt.Sprintf("label_%d", j),
 					Value: fmt.Sprintf("value_%d_%d", i, j),
 				})
@@ -57,8 +59,8 @@ func TestGetLabelsHash_Distribution(t *testing.T) {
 	f(10)
 }
 
-func TestRemoteWriteContext_TryPush_ImmutableTimeseries(t *testing.T) {
-	f := func(streamAggrConfig, relabelConfig string, enableWindows bool, dedupInterval time.Duration, keepInput, dropInput bool, input string) {
+func TestRemoteWriteContext_TryPushTimeSeries(t *testing.T) {
+	f := func(streamAggrConfig, relabelConfig string, enableWindows bool, dedupInterval time.Duration, keepInput, dropInput bool, input string, expectedRowsPushedAfterRelabel, expectedPushedSample int) {
 		t.Helper()
 		perURLRelabel, err := promrelabel.ParseRelabelConfigsData([]byte(relabelConfig))
 		if err != nil {
@@ -71,10 +73,16 @@ func TestRemoteWriteContext_TryPush_ImmutableTimeseries(t *testing.T) {
 		}
 		allRelabelConfigs.Store(rcs)
 
+		path := "fast-queue-write-test"
+		fs.MustRemoveDir(path)
+		fq := persistentqueue.MustOpenFastQueue(path, "test", 100, 0, false)
+		defer fs.MustRemoveDir(path)
+		defer fq.MustClose()
+
 		pss := make([]*pendingSeries, 1)
 		isVMProto := &atomic.Bool{}
 		isVMProto.Store(true)
-		pss[0] = newPendingSeries(nil, isVMProto, 0, 100)
+		pss[0] = newPendingSeries(fq, isVMProto, 0, 100)
 		rwctx := &remoteWriteCtx{
 			idx:                    0,
 			streamAggrKeepInput:    keepInput,
@@ -83,12 +91,14 @@ func TestRemoteWriteContext_TryPush_ImmutableTimeseries(t *testing.T) {
 			rowsPushedAfterRelabel: metrics.GetOrCreateCounter(`foo`),
 			rowsDroppedByRelabel:   metrics.GetOrCreateCounter(`bar`),
 		}
+		defer metrics.UnregisterAllMetrics()
+
 		if dedupInterval > 0 {
 			rwctx.deduplicator = streamaggr.NewDeduplicator(nil, enableWindows, dedupInterval, nil, "dedup-global")
 		}
 
 		if streamAggrConfig != "" {
-			pushNoop := func(_ []prompbmarshal.TimeSeries) {}
+			pushNoop := func(_ []prompb.TimeSeries) {}
 			opts := streamaggr.Options{
 				EnableWindows: enableWindows,
 			}
@@ -102,12 +112,20 @@ func TestRemoteWriteContext_TryPush_ImmutableTimeseries(t *testing.T) {
 
 		offsetMsecs := time.Now().UnixMilli()
 		inputTss := prometheus.MustParsePromMetrics(input, offsetMsecs)
-		expectedTss := make([]prompbmarshal.TimeSeries, len(inputTss))
+		expectedTss := make([]prompb.TimeSeries, len(inputTss))
 
-		// copy inputTss to make sure it is not mutated during TryPush call
+		// check inputTss is not modified after TryPushTimeSeries
 		copy(expectedTss, inputTss)
-		if !rwctx.TryPush(inputTss, false) {
+		if !rwctx.TryPushTimeSeries(inputTss, false) {
 			t.Fatalf("cannot push samples to rwctx")
+		}
+
+		if int(rwctx.rowsPushedAfterRelabel.Get()) != expectedRowsPushedAfterRelabel {
+			t.Fatalf("unexpected number of rows after relabel; got %d; want %d", rwctx.rowsPushedAfterRelabel.Get(), expectedRowsPushedAfterRelabel)
+		}
+
+		if len(pss[0].wr.tss) != expectedPushedSample {
+			t.Fatalf("unexpected number of pushed samples; got %d; want %d", len(pss[0].wr.tss), expectedPushedSample)
 		}
 
 		if !reflect.DeepEqual(expectedTss, inputTss) {
@@ -115,12 +133,8 @@ func TestRemoteWriteContext_TryPush_ImmutableTimeseries(t *testing.T) {
 		}
 	}
 
-	f(`
-- interval: 1m
-  outputs: [sum_samples]
-- interval: 2m
-  outputs: [count_series]
-`, `
+	// relabeling
+	f(``, `
 - action: keep
   source_labels: [env]
   regex: "dev"
@@ -129,53 +143,66 @@ metric{env="dev"} 10
 metric{env="bar"} 20
 metric{env="dev"} 15
 metric{env="bar"} 25
-`)
+`, 2, 2)
+
+	// relabeling + aggregation
+	f(`
+- match: '{env="dev"}'
+  interval: 1m
+  outputs: [sum_samples]
+`, `
+- action: keep
+  source_labels: [env]
+  regex: ".*"
+`, false, 0, false, false, `
+metric{env="dev"} 10
+metric{env="bar"} 20
+metric{env="dev"} 15
+metric{env="bar"} 25
+`, 4, 2)
+
+	// aggregation + keepInput
+	f(`
+- match: '{env="dev"}'
+  interval: 1m
+  outputs: [sum_samples]
+`, ``, false, 0, true, false, `
+metric{env="dev"} 10
+metric{env="bar"} 20
+metric{env="dev"} 15
+metric{env="bar"} 25
+`, 4, 4)
+
+	// aggregation + dropInput
+	f(`
+- match: '{env="dev"}'
+  interval: 1m
+  outputs: [sum_samples]
+`, ``, false, 0, false, true, `
+metric{env="dev"} 10
+metric{env="bar"} 20
+metric{env="dev"} 15
+metric{env="bar"} 25
+`, 4, 0)
+
+	// aggregation + keepInput + dropInput
+	f(`
+- match: '{env="dev"}'
+  interval: 1m
+  outputs: [sum_samples]
+`, ``, false, 0, true, true, `
+metric{env="dev"} 10
+metric{env="bar"} 20
+metric{env="bar"} 25
+`, 3, 1)
+
+	// aggregation + deduplication
 	f(``, ``, true, time.Hour, false, false, `
 metric{env="dev"} 10
 metric{env="foo"} 20
 metric{env="dev"} 15
 metric{env="foo"} 25
-`)
-	f(``, `
-- action: keep
-  source_labels: [env]
-  regex: "dev"
-`, true, time.Hour, false, false, `
-metric{env="dev"} 10
-metric{env="bar"} 20
-metric{env="dev"} 15
-metric{env="bar"} 25
-`)
-	f(``, `
-- action: keep
-  source_labels: [env]
-  regex: "dev"
-`, true, time.Hour, true, false, `
-metric{env="test"} 10
-metric{env="dev"} 20
-metric{env="foo"} 15
-metric{env="dev"} 25
-`)
-	f(``, `
-- action: keep
-  source_labels: [env]
-  regex: "dev"
-`, true, time.Hour, false, true, `
-metric{env="foo"} 10
-metric{env="dev"} 20
-metric{env="foo"} 15
-metric{env="dev"} 25
-`)
-	f(``, `
-- action: keep
-  source_labels: [env]
-  regex: "dev"
-`, true, time.Hour, true, true, `
-metric{env="dev"} 10
-metric{env="test"} 20
-metric{env="dev"} 15
-metric{env="bar"} 25
-`)
+`, 4, 0)
 }
 
 func TestShardAmountRemoteWriteCtx(t *testing.T) {
@@ -220,16 +247,16 @@ func TestShardAmountRemoteWriteCtx(t *testing.T) {
 
 		seriesCount := 100000
 		// build 1000000 series
-		tssBlock := make([]prompbmarshal.TimeSeries, 0, seriesCount)
+		tssBlock := make([]prompb.TimeSeries, 0, seriesCount)
 		for i := 0; i < seriesCount; i++ {
-			tssBlock = append(tssBlock, prompbmarshal.TimeSeries{
-				Labels: []prompbmarshal.Label{
+			tssBlock = append(tssBlock, prompb.TimeSeries{
+				Labels: []prompb.Label{
 					{
 						Name:  "label",
 						Value: strconv.Itoa(i),
 					},
 				},
-				Samples: []prompbmarshal.Sample{
+				Samples: []prompb.Sample{
 					{
 						Timestamp: 0,
 						Value:     0,
@@ -258,7 +285,7 @@ func TestShardAmountRemoteWriteCtx(t *testing.T) {
 		for i, nodeIdx := range healthyIdx {
 			for _, ts := range shards[i] {
 				// add it to node[nodeIdx]'s active time series
-				activeTimeSeriesByNodes[nodeIdx][prompbmarshal.LabelsToString(ts.Labels)] = struct{}{}
+				activeTimeSeriesByNodes[nodeIdx][prompb.LabelsToString(ts.Labels)] = struct{}{}
 			}
 		}
 
@@ -281,7 +308,7 @@ func TestShardAmountRemoteWriteCtx(t *testing.T) {
 		for i, nodeIdx := range healthyIdx {
 			for _, ts := range shards[i] {
 				// add it to node[nodeIdx]'s active time series
-				activeTimeSeriesByNodes[nodeIdx][prompbmarshal.LabelsToString(ts.Labels)] = struct{}{}
+				activeTimeSeriesByNodes[nodeIdx][prompb.LabelsToString(ts.Labels)] = struct{}{}
 			}
 		}
 

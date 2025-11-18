@@ -1,3 +1,11 @@
+---
+build:
+  list: never
+  publishResources: false
+  render: never
+sitemap:
+  disable: true
+---
 This guide is based on capacity planning for [Single-Node](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#capacity-planning),
 [Cluster](https://docs.victoriametrics.com/victoriametrics/cluster-victoriametrics/#capacity-planning)
 and [VictoriaMetrics Cloud](https://docs.victoriametrics.com/victoriametrics-cloud/) docs.
@@ -5,7 +13,7 @@ and [VictoriaMetrics Cloud](https://docs.victoriametrics.com/victoriametrics-clo
 ## Terminology
 
 - [Active Time Series](https://docs.victoriametrics.com/victoriametrics/faq/#what-is-an-active-time-series) - a [time series](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#time-series)
-  that was update at least one time during the last hour;
+  that was updated at least one time during the last hour;
 - Ingestion Rate - how many [samples](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#raw-samples) are ingest into the database per second;
 - [Churn Rate](https://docs.victoriametrics.com/victoriametrics/faq/#what-is-high-churn-rate) - how frequently a new [time series](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#time-series)
   is created. For example, changing pod name in Kubernetes is a common source of time series churn;
@@ -117,7 +125,7 @@ As a reference, see resource consumption of VictoriaMetrics cluster on our [play
 The Retention Period is the number of days or months for storing data. It affects the disk space usage.
 The formula for calculating required disk space is the following:
 ```
-Bytes Per Sample * Ingestion rate * Replication Factor * (Retention Period in Seconds +1 Retention Cycle(day or month)) * 1.2 (recommended 20% of dree space for merges ) 
+Bytes Per Sample * Ingestion rate * Replication Factor * (Retention Period in Seconds +1 Retention Cycle(day or month)) * 1.2 (recommended 20% of free space for merges ) 
 ```
 
 The **Retention Cycle** is one **day** or one **month**. If the retention period is higher than 30 days cycle is a month; otherwise day.
@@ -148,12 +156,15 @@ See a blog post about [reducing expenses on monitoring](https://victoriametrics.
 
 It is [recommended](https://docs.victoriametrics.com/victoriametrics/cluster-victoriametrics/#cluster-setup) to run many small vmstorage
 nodes over a few big vmstorage nodes. This reduces the workload increase on the remaining vmstorage nodes when some of
-vmstorage nodes become temporarily unavailable. Prefer giving at least 2 vCPU per each vmstorage node.
+vmstorage nodes become temporarily unavailable. Prefer allocating the whole number of vCPU cores per each vmstorage node
+for optimal performance.
 
 In general, the optimal number of vmstorage nodes is between 10 and 50. Please note, while adding more vmstorage nodes
 is a straightforward process, decreasing number of vmstorage nodes is a very complex process that should be avoided.
 
 vminsert and vmselect components are stateless, and can be easily scaled up or down. Scale them accordingly to your load.
+
+See also [Capacity planning docs for VictoriaMetrics cluster](https://docs.victoriametrics.com/victoriametrics/cluster-victoriametrics/#capacity-planning).
 
 ## Align Terms with VictoriaMetrics setups
 

@@ -19,7 +19,6 @@ import (
 
 	"gopkg.in/yaml.v2"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config"
 	vmalertconfig "github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
@@ -35,6 +34,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 	"github.com/VictoriaMetrics/metrics"
 )
@@ -85,7 +85,8 @@ func UnitTest(files []string, disableGroupLabel bool, externalLabels []string, e
 		defer server.Close()
 	} else {
 		httpListenAddr = httpListenPort
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%s", httpListenPort))
+
+		ln, err := net.Listen(netutil.GetTCPNetwork(), fmt.Sprintf(":%s", httpListenPort))
 		if err != nil {
 			logger.Fatalf("cannot listen on port %s: %v", httpListenPort, err)
 		}
@@ -107,12 +108,12 @@ func UnitTest(files []string, disableGroupLabel bool, externalLabels []string, e
 	vminsert.Init()
 	vmselect.Init()
 	// storagePath will be created again when closing vmselect, so remove it again.
-	defer fs.MustRemoveAll(storagePath)
+	defer fs.MustRemoveDir(storagePath)
 	defer vminsert.Stop()
 	defer vmselect.Stop()
 	disableAlertgroupLabel = disableGroupLabel
 
-	testfiles, err := config.ReadFromFS(files)
+	testfiles, err := vmalertconfig.ReadFromFS(files)
 	if err != nil {
 		logger.Fatalf("failed to load test files %q: %v", files, err)
 	}
@@ -131,7 +132,7 @@ func UnitTest(files []string, disableGroupLabel bool, externalLabels []string, e
 		}
 		labels[s[:n]] = s[n+1:]
 	}
-	_, err = notifier.Init(nil, labels, externalURL)
+	err = notifier.Init(labels, externalURL)
 	if err != nil {
 		logger.Fatalf("failed to init notifier: %v", err)
 	}
@@ -304,7 +305,7 @@ checkCheck:
 func tearDown() {
 	vmstorage.Stop()
 	metrics.UnregisterAllMetrics()
-	fs.MustRemoveAll(storagePath)
+	fs.MustRemoveDir(storagePath)
 }
 
 func (tg *testGroup) test(evalInterval time.Duration, groupOrderMap map[string]int, testGroups []vmalertconfig.Group, externalLabels map[string]string) (checkErrs []error) {
@@ -367,6 +368,7 @@ func (tg *testGroup) test(evalInterval time.Duration, groupOrderMap map[string]i
 			mergedExternalLabels[k] = v
 		}
 		ng := rule.NewGroup(group, q, time.Minute, mergedExternalLabels)
+		ng.Init()
 		groups = append(groups, ng)
 	}
 
@@ -377,7 +379,7 @@ func (tg *testGroup) test(evalInterval time.Duration, groupOrderMap map[string]i
 			if len(g.Rules) == 0 {
 				continue
 			}
-			errs := g.ExecOnce(context.Background(), func() []notifier.Notifier { return nil }, rw, ts)
+			errs := g.ExecOnce(context.Background(), rw, ts)
 			for err := range errs {
 				if err != nil {
 					checkErrs = append(checkErrs, fmt.Errorf("\nfailed to exec group: %q, time: %s, err: %w", g.Name,

@@ -20,6 +20,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage/metricsmetadata"
 )
 
 var (
@@ -203,10 +204,7 @@ var defaultMaxWorkersPerQuery = func() int {
 	// for processing an average query, without significant impact on inter-CPU communications.
 	const maxWorkersLimit = 32
 
-	n := gomaxprocs
-	if n > maxWorkersLimit {
-		n = maxWorkersLimit
-	}
+	n := min(gomaxprocs, maxWorkersLimit)
 	return n
 }()
 
@@ -269,7 +267,7 @@ func (rss *Results) runParallel(qt *querytracer.Tracer, f func(rs *Result, worke
 	}
 
 	// Slow path - spin up multiple local workers for parallel data processing.
-	// Do not use global workers pool, since it increases inter-CPU memory ping-poing,
+	// Do not use global workers pool, since it increases inter-CPU memory ping-pong,
 	// which reduces the scalability on systems with many CPU cores.
 
 	// Prepare the work for workers.
@@ -279,10 +277,7 @@ func (rss *Results) runParallel(qt *querytracer.Tracer, f func(rs *Result, worke
 	}
 
 	// Prepare worker channels.
-	workers := len(tsws)
-	if workers > maxWorkers {
-		workers = maxWorkers
-	}
+	workers := min(len(tsws), maxWorkers)
 	itemsPerWorker := (len(tsws) + workers - 1) / workers
 	workChs := make([]chan *timeseriesWork, workers)
 	for i := range workChs {
@@ -485,7 +480,7 @@ func (pts *packedTimeseries) unpackTo(dst []*sortBlock, tbf *tmpBlocksFile, tr s
 	}
 
 	// Slow path - spin up multiple local workers for parallel data unpacking.
-	// Do not use global workers pool, since it increases inter-CPU memory ping-poing,
+	// Do not use global workers pool, since it increases inter-CPU memory ping-pong,
 	// which reduces the scalability on systems with many CPU cores.
 
 	// Prepare the work for workers.
@@ -497,10 +492,7 @@ func (pts *packedTimeseries) unpackTo(dst []*sortBlock, tbf *tmpBlocksFile, tr s
 	}
 
 	// Prepare worker channels.
-	workers := len(upws)
-	if workers > gomaxprocs {
-		workers = gomaxprocs
-	}
+	workers := min(len(upws), gomaxprocs)
 	if workers < 1 {
 		workers = 1
 	}
@@ -874,6 +866,23 @@ func LabelValues(qt *querytracer.Tracer, labelName string, sq *storage.SearchQue
 	return labelValues, nil
 }
 
+// GetMetricsMetadata returns time series metric names metadata for the given args
+func GetMetricsMetadata(qt *querytracer.Tracer, limit int, metricName string) ([]*metricsmetadata.Row, error) {
+	qt = qt.NewChild("get metrics metadata: limit=%d, metric_name=%q", limit, metricName)
+	defer qt.Done()
+
+	metadata := vmstorage.Storage.GetMetadataRows(qt, limit, metricName)
+
+	sort.Slice(metadata, func(i, j int) bool {
+		return string(metadata[i].MetricFamilyName) < string(metadata[j].MetricFamilyName)
+	})
+	if limit > 0 && len(metadata) >= limit {
+		metadata = metadata[:limit]
+	}
+
+	return metadata, nil
+}
+
 // GraphiteTagValues returns tag values for the given tagName until the given deadline.
 func GraphiteTagValues(qt *querytracer.Tracer, tagName, filter string, limit int, deadline searchutil.Deadline) ([]string, error) {
 	qt = qt.NewChild("get graphite tag values for tagName=%s, filter=%s, limit=%d", tagName, filter, limit)
@@ -1153,10 +1162,7 @@ func ProcessSearchQuery(qt *querytracer.Tracer, sq *storage.SearchQuery, deadlin
 	// metricNamesBuf is used for holding all the loaded unique metric names at m and orderedMetricNames.
 	// It should reduce pressure on Go GC by reducing the number of string allocations
 	// when constructing metricName string from byte slice.
-	metricNamesBufCap := maxSeriesCount * 100
-	if metricNamesBufCap > maxFastAllocBlockSize {
-		metricNamesBufCap = maxFastAllocBlockSize
-	}
+	metricNamesBufCap := min(maxSeriesCount*100, maxFastAllocBlockSize)
 	metricNamesBuf := make([]byte, 0, metricNamesBufCap)
 
 	// brssPool is used for holding all the blockRefs objects across all the loaded time series.
@@ -1165,10 +1171,7 @@ func ProcessSearchQuery(qt *querytracer.Tracer, sq *storage.SearchQuery, deadlin
 
 	// brsPool is used for holding the most of blockRefs.brs slices across all the loaded time series.
 	// It should reduce pressure on Go GC by reducing the number of allocations for blockRefs.brs slices.
-	brsPoolCap := uintptr(maxSeriesCount)
-	if brsPoolCap > maxFastAllocBlockSize/unsafe.Sizeof(blockRef{}) {
-		brsPoolCap = maxFastAllocBlockSize / unsafe.Sizeof(blockRef{})
-	}
+	brsPoolCap := min(uintptr(maxSeriesCount), maxFastAllocBlockSize/unsafe.Sizeof(blockRef{}))
 	brsPool := make([]blockRef, 0, brsPoolCap)
 
 	// m maps from metricName to the index of blockRefs inside brssPool

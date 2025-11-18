@@ -49,7 +49,7 @@ var (
 	minWindowForInstantRollupOptimization = flag.Duration("search.minWindowForInstantRollupOptimization", time.Hour*3, "Enable cache-based optimization for repeated queries "+
 		"to /api/v1/query (aka instant queries), which contain rollup functions with lookbehind window exceeding the given value")
 	maxBinaryOpPushdownLabelValues = flag.Int("search.maxBinaryOpPushdownLabelValues", 100, "The maximum number of values for a label in the first expression that can be extracted as a common label filter and pushed down to the second expression in a binary operation. "+
-		"A larger value makes the pushed-down filter more complex but fewer time series will be returned. This flag is useful when selective label contains numerous values, for example `instance`, and storage resources are abundant.")
+		"A larger value makes the pushed-down filter more complex but fewer time series will be returned. This flag is useful when selective label (e.g., 'instance') contains numerous values, and storage resources are abundant.")
 )
 
 // The minimum number of points per timeseries for enabling time rounding.
@@ -1002,10 +1002,7 @@ func getKeepMetricNames(expr metricsql.Expr) bool {
 }
 
 func doParallel(tss []*timeseries, f func(ts *timeseries, values []float64, timestamps []int64, workerID uint) ([]float64, []int64)) {
-	workers := netstorage.MaxWorkers()
-	if workers > len(tss) {
-		workers = len(tss)
-	}
+	workers := min(netstorage.MaxWorkers(), len(tss))
 	seriesPerWorker := (len(tss) + workers - 1) / workers
 	workChs := make([]chan *timeseries, workers)
 	for i := range workChs {
@@ -1079,10 +1076,7 @@ func evalInstantRollup(qt *querytracer.Tracer, ec *EvalConfig, funcName string, 
 		return evalRollupFuncNoCache(qt, ecCopy, funcName, rf, expr, me, iafc, window, pointsPerSeries)
 	}
 	tooBigOffset := func(offset int64) bool {
-		maxOffset := window / 2
-		if maxOffset > 1800*1000 {
-			maxOffset = 1800 * 1000
-		}
+		maxOffset := min(window/2, 1800*1000)
 		return offset >= maxOffset
 	}
 	deleteCachedSeries := func(qt *querytracer.Tracer) {
@@ -1156,15 +1150,23 @@ func evalInstantRollup(qt *querytracer.Tracer, ec *EvalConfig, funcName string, 
 		}
 		qt.Printf("optimized calculation for instant rollup avg_over_time(m[d]) as (sum_over_time(m[d]) / count_over_time(m[d]))")
 		fe := expr.(*metricsql.FuncExpr)
-		feSum := *fe
-		feSum.Name = "sum_over_time"
-		feCount := *fe
-		feCount.Name = "count_over_time"
+		// copy RollupExpr to drop possible offset,
+		// see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/9762
+		newArg := copyRollupExpr(fe.Args[0].(*metricsql.RollupExpr))
+		newArg.Offset = nil
 		be := &metricsql.BinaryOpExpr{
 			Op:              "/",
 			KeepMetricNames: fe.KeepMetricNames,
-			Left:            &feSum,
-			Right:           &feCount,
+			Left: &metricsql.FuncExpr{
+				Name:            "sum_over_time",
+				Args:            []metricsql.Expr{newArg},
+				KeepMetricNames: fe.KeepMetricNames,
+			},
+			Right: &metricsql.FuncExpr{
+				Name:            "count_over_time",
+				Args:            []metricsql.Expr{newArg},
+				KeepMetricNames: fe.KeepMetricNames,
+			},
 		}
 		return evalExpr(qt, ec, be)
 	case "rate":
@@ -1178,8 +1180,12 @@ func evalInstantRollup(qt *querytracer.Tracer, ec *EvalConfig, funcName string, 
 			fe := afe.Args[0].(*metricsql.FuncExpr)
 			feIncrease := *fe
 			feIncrease.Name = "increase"
-			re := fe.Args[0].(*metricsql.RollupExpr)
-			d := re.Window.Duration(ec.Step)
+			// copy RollupExpr to drop possible offset,
+			// see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/9762
+			newArg := copyRollupExpr(fe.Args[0].(*metricsql.RollupExpr))
+			newArg.Offset = nil
+			feIncrease.Args = []metricsql.Expr{newArg}
+			d := newArg.Window.Duration(ec.Step)
 			if d == 0 {
 				d = ec.Step
 			}
@@ -1199,8 +1205,12 @@ func evalInstantRollup(qt *querytracer.Tracer, ec *EvalConfig, funcName string, 
 		fe := expr.(*metricsql.FuncExpr)
 		feIncrease := *fe
 		feIncrease.Name = "increase"
-		re := fe.Args[0].(*metricsql.RollupExpr)
-		d := re.Window.Duration(ec.Step)
+		// copy RollupExpr to drop possible offset,
+		// see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/9762
+		newArg := copyRollupExpr(fe.Args[0].(*metricsql.RollupExpr))
+		newArg.Offset = nil
+		feIncrease.Args = []metricsql.Expr{newArg}
+		d := newArg.Window.Duration(ec.Step)
 		if d == 0 {
 			d = ec.Step
 		}
@@ -1974,14 +1984,11 @@ func sumNoOverflow(a, b int64) int64 {
 }
 
 func dropStaleNaNs(funcName string, values []float64, timestamps []int64) ([]float64, []int64) {
-	if *noStaleMarkers || funcName == "stale_samples_over_time" ||
-		funcName == "default_rollup" || funcName == "increase" || funcName == "rate" {
+	if *noStaleMarkers || funcName == "default_rollup" || funcName == "stale_samples_over_time" {
 		// Do not drop Prometheus staleness marks (aka stale NaNs) for default_rollup() function,
 		// since it uses them for Prometheus-style staleness detection.
 		// Do not drop staleness marks for stale_samples_over_time() function, since it needs
 		// to calculate the number of staleness markers.
-		// Do not drop staleness marks for increase() and rate() function, so they could stop
-		// returning results for stale series. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8891
 		return values, timestamps
 	}
 	// Remove Prometheus staleness marks, so non-default rollup functions don't hit NaN values.
@@ -2007,4 +2014,24 @@ func dropStaleNaNs(funcName string, values []float64, timestamps []int64) ([]flo
 		dstTimestamps = append(dstTimestamps, timestamps[i])
 	}
 	return dstValues, dstTimestamps
+}
+
+func copyRollupExpr(re *metricsql.RollupExpr) *metricsql.RollupExpr {
+	var newRe metricsql.RollupExpr
+	newRe.Expr = re.Expr
+	newRe.InheritStep = re.InheritStep
+	newRe.At = re.At
+	if re.Window != nil {
+		newRe.Window = &metricsql.DurationExpr{}
+		*newRe.Window = *re.Window
+	}
+	if re.Offset != nil {
+		newRe.Offset = &metricsql.DurationExpr{}
+		*newRe.Offset = *re.Offset
+	}
+	if re.Step != nil {
+		newRe.Step = &metricsql.DurationExpr{}
+		*newRe.Step = *re.Step
+	}
+	return &newRe
 }

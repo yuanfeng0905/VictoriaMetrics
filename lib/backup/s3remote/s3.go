@@ -14,6 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -21,8 +22,8 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/fscommon"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 )
 
 var (
@@ -45,9 +46,14 @@ func validateStorageClass(storageClass s3types.StorageClass) error {
 	return fmt.Errorf("unsupported S3 storage class: %s. Supported values: %v", storageClass, supportedStorageClasses)
 }
 
-// StringToS3StorageClass converts string types to AWS S3 StorageClass type for value comparison
-func StringToS3StorageClass(sc string) s3types.StorageClass {
+// StringToStorageClass converts string types to AWS S3 StorageClass type for value comparison
+func StringToStorageClass(sc string) s3types.StorageClass {
 	return s3types.StorageClass(sc)
+}
+
+// StringToChecksumAlgorithm converts string types to AWS S3 ChecksumAlgorithm type for value comparison
+func StringToChecksumAlgorithm(alg string) s3types.ChecksumAlgorithm {
+	return s3types.ChecksumAlgorithm(alg)
 }
 
 // FS represents filesystem for backups in S3.
@@ -74,6 +80,9 @@ type FS struct {
 
 	// Object Storage Class: https://aws.amazon.com/s3/storage-classes/
 	StorageClass s3types.StorageClass
+
+	// Checksum algorithm
+	ChecksumAlgorithm s3types.ChecksumAlgorithm
 
 	// The name of S3 config profile to use.
 	ProfileName string
@@ -115,6 +124,8 @@ func (fs *FS) Init(ctx context.Context) error {
 	}
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithDefaultRegion("us-east-1"),
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 		config.WithRetryer(func() aws.Retryer {
 			return retry.NewStandard(func(o *retry.StandardOptions) {
 				o.Backoff = retry.NewExponentialJitterBackoff(3 * time.Minute)
@@ -159,15 +170,26 @@ func (fs *FS) Init(ctx context.Context) error {
 		return err
 	}
 
-	tr := httputil.NewTransport(true, "vmbackup_s3_client")
-	if fs.TLSInsecureSkipVerify {
-		tr.TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true,
+	// Use AWS client in order to allow SDK to override transport configuration
+	// based on additional configuration from environment variables.
+	// See: https://github.com/VictoriaMetrics/VictoriaMetrics/issues/9858
+	c := awshttp.NewBuildableClient()
+	if cfg.HTTPClient != nil {
+		trOpts, ok := cfg.HTTPClient.(*awshttp.BuildableClient)
+		if ok {
+			c = trOpts
 		}
 	}
-	cfg.HTTPClient = &http.Client{
-		Transport: tr,
-	}
+	cfg.HTTPClient = c.WithTransportOptions(func(t *http.Transport) {
+		if fs.TLSInsecureSkipVerify {
+			if t.TLSClientConfig == nil {
+				t.TLSClientConfig = &tls.Config{}
+			}
+			t.TLSClientConfig.InsecureSkipVerify = true
+		}
+
+		t.DialContext = netutil.NewStatDialFunc("vmbackup_s3_client")
+	})
 
 	var outerErr error
 	fs.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
@@ -194,6 +216,7 @@ func (fs *FS) Init(ctx context.Context) error {
 	fs.uploader = manager.NewUploader(fs.s3, func(u *manager.Uploader) {
 		// We manage upload concurrency by ourselves.
 		u.Concurrency = 1
+		u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 	})
 
 	m := make(map[string]*string)
@@ -340,12 +363,13 @@ func (fs *FS) UploadPart(p common.Part, r io.Reader) error {
 		r: r,
 	}
 	input := &s3.PutObjectInput{
-		Bucket:       aws.String(fs.Bucket),
-		Key:          aws.String(path),
-		Body:         sr,
-		StorageClass: fs.StorageClass,
-		Metadata:     fs.Metadata,
-		Tagging:      fs.tags,
+		Bucket:            aws.String(fs.Bucket),
+		Key:               aws.String(path),
+		Body:              sr,
+		StorageClass:      fs.StorageClass,
+		Metadata:          fs.Metadata,
+		ChecksumAlgorithm: fs.ChecksumAlgorithm,
+		Tagging:           fs.tags,
 	}
 
 	_, err := fs.uploader.Upload(fs.ctx, input)
@@ -432,12 +456,13 @@ func (fs *FS) CreateFile(filePath string, data []byte) error {
 		r: bytes.NewReader(data),
 	}
 	input := &s3.PutObjectInput{
-		Bucket:       aws.String(fs.Bucket),
-		Key:          aws.String(path),
-		Body:         sr,
-		StorageClass: fs.StorageClass,
-		Metadata:     fs.Metadata,
-		Tagging:      fs.tags,
+		Bucket:            aws.String(fs.Bucket),
+		Key:               aws.String(path),
+		Body:              sr,
+		StorageClass:      fs.StorageClass,
+		Metadata:          fs.Metadata,
+		ChecksumAlgorithm: fs.ChecksumAlgorithm,
+		Tagging:           fs.tags,
 	}
 	_, err := fs.uploader.Upload(fs.ctx, input)
 	if err != nil {

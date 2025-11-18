@@ -10,7 +10,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/vmalertutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 )
 
@@ -166,8 +166,8 @@ func templateAnnotations(annotations map[string]string, data AlertTplData, tmpl 
 		ctmpl, _ := tmpl.Clone()
 		ctmpl = ctmpl.Option("missingkey=zero")
 		if err := templateAnnotation(&buf, builder.String(), tData, ctmpl, execute); err != nil {
-			r[key] = text
-			eg.Add(fmt.Errorf("key %q, template %q: %w", key, text, err))
+			r[key] = err.Error()
+			eg.Add(fmt.Errorf("(key: %q, value: %q): %w", key, text, err))
 			continue
 		}
 		r[key] = buf.String()
@@ -184,21 +184,21 @@ type tplData struct {
 func templateAnnotation(dst io.Writer, text string, data tplData, tpl *textTpl.Template, execute bool) error {
 	tpl, err := tpl.Parse(text)
 	if err != nil {
-		return fmt.Errorf("error parsing annotation template: %w", err)
+		return fmt.Errorf("error parsing template: %w", err)
 	}
 	if !execute {
 		return nil
 	}
 	if err = tpl.Execute(dst, data); err != nil {
-		return fmt.Errorf("error evaluating annotation template: %w", err)
+		return fmt.Errorf("error evaluating template: %w", err)
 	}
 	return nil
 }
 
-func (a Alert) applyRelabelingIfNeeded(relabelCfg *promrelabel.ParsedConfigs) []prompbmarshal.Label {
-	var labels []prompbmarshal.Label
+func (a Alert) applyRelabelingIfNeeded(relabelCfg *promrelabel.ParsedConfigs) []prompb.Label {
+	var labels []prompb.Label
 	for k, v := range a.Labels {
-		labels = append(labels, prompbmarshal.Label{
+		labels = append(labels, prompb.Label{
 			Name:  promrelabel.SanitizeMetricName(k),
 			Value: v,
 		})

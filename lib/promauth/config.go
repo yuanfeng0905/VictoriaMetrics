@@ -326,7 +326,7 @@ func (ac *Config) HeadersNoAuthString() string {
 // SetHeaders sets the configured ac headers to req.
 func (ac *Config) SetHeaders(req *http.Request, setAuthHeader bool) error {
 	if ac.tlsServerName != "" {
-		// It tlsServerName is set, then it is likely the request is performed via IP address instead of hostname.
+		// If tlsServerName is set, then it is likely the request is performed via IP address instead of hostname.
 		// In this case users expect that the specified tlsServerName is used as a Host header in the request to https server.
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/5802
 		req.Host = ac.tlsServerName
@@ -663,7 +663,7 @@ func (opts *Options) NewConfig() (*Config, error) {
 	}
 	if opts.OAuth2 != nil {
 		if actx.getAuthHeader != nil {
-			return nil, fmt.Errorf("cannot simultaneously use `authorization`, `basic_auth, `bearer_token` and `ouath2`")
+			return nil, fmt.Errorf("cannot simultaneously use `authorization`, `basic_auth, `bearer_token` and `oauth2`")
 		}
 		if err := actx.initFromOAuth2Config(baseDir, opts.OAuth2); err != nil {
 			return nil, fmt.Errorf("cannot initialize oauth2: %w", err)
